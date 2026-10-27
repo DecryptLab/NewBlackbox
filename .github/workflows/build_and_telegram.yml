@@ -1,9 +1,13 @@
-name: Build APK
+name: CarromPredictor
 
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -31,5 +35,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: blackbox-debug-apk
+          name: CarromPredictor
           path: predictor/build/outputs/apk/debug/*.apk
