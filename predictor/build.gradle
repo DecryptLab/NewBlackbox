@@ -1,0 +1,42 @@
+plugins {
+    alias(libs.plugins.android.application)
+}
+
+android {
+    namespace 'com.predictor'
+    compileSdk rootProject.ext.compileSdkVersion
+    ndkVersion "29.0.13846066"
+
+    defaultConfig {
+        applicationId "com.predictor"
+        minSdk rootProject.ext.minSdk
+        targetSdk rootProject.ext.targetSdkVersion
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_21
+        targetCompatibility JavaVersion.VERSION_21
+    }
+
+    lintOptions {
+        abortOnError false
+    }
+
+    applicationVariants.configureEach { variant ->
+        variant.outputs.configureEach { output ->
+            output.outputFileName = "CarromPredictor_${variant.versionName}.apk"
+        }
+    }
+}
+
+dependencies {
+    implementation project(':Bcore')
+}
