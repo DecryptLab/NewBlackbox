@@ -30,6 +30,9 @@ public class PredictorApp extends Application {
             });
         } catch (Throwable t) { Log.e(TAG, "doAttachBaseContext " + t); }
 
+        try { BlackBoxCore.get().addAppLifecycleCallback(new GameHook()); }
+        catch (Throwable t) { Log.e(TAG, "addAppLifecycleCallback " + t); }
+
         try { BlackBoxCore.get().onAfterMainApplicationAttach(this, base); }
         catch (Throwable t) { Log.e(TAG, "afterAttach " + t); }
     }
