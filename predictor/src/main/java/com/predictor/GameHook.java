@@ -27,6 +27,7 @@ public class GameHook extends AppLifecycleCallback {
 
     private static final class Scan {
         final Set<String> app = new TreeSet<>();
+        final Set<String> engineLines = new TreeSet<>();
         int total = 0;
     }
 
@@ -41,18 +42,12 @@ public class GameHook extends AppLifecycleCallback {
         final Application app = application;
         new Thread(() -> {
             Scan scan = new Scan();
-            String engine = null;
-            int last = -1, stable = 0;
-            for (int i = 0; i < 90; i++) {
+            for (int i = 0; i < 180; i++) {          // up to 90 seconds
                 scan = scan();
-                engine = findEngine(scan.app);
-                if (engine != null) break;
-                if (scan.app.size() == last) stable++; else stable = 0;
-                last = scan.app.size();
-                if (i >= 8 && stable >= 6) break;   // >=4s in, and stable for 3s
+                if (!scan.engineLines.isEmpty()) break;
                 try { Thread.sleep(500); } catch (InterruptedException ignored) { }
             }
-            final String report = buildReport(scan, engine);
+            final String report = buildReport(scan);
             Log.d(TAG, report);
             new Handler(Looper.getMainLooper()).post(() -> showOverlay(app, report));
         }).start();
@@ -63,22 +58,24 @@ public class GameHook extends AppLifecycleCallback {
         return false;
     }
 
-    private String findEngine(Set<String> libs) {
-        for (String l : libs) {
-            if (l.matches("(?i).*(carrom|il2cpp|unity|mono|cocos).*")) return l;
-        }
-        return null;
-    }
-
-    private String buildReport(Scan scan, String engine) {
+    private String buildReport(Scan scan) {
         StringBuilder sb = new StringBuilder();
-        sb.append("Predictor hook OK\n");
+        sb.append("Predictor hook v3\n");
         sb.append("pid=").append(android.os.Process.myPid()).append("\n");
         sb.append("total libs=").append(scan.total).append("\n");
         sb.append("app libs=").append(scan.app.size()).append("\n");
-        sb.append("engine=").append(engine == null ? "NOT FOUND" : engine).append("\n");
-        sb.append("--- app libs ---\n");
+        sb.append("engine=").append(scan.engineLines.isEmpty() ? "NOT FOUND" : "FOUND").append("\n");
+
+        sb.append("--- engine map ---\n");
         int n = 0;
+        for (String l : scan.engineLines) {
+            sb.append(l).append("\n");
+            if (++n >= 5) { sb.append("...\n"); break; }
+        }
+        if (n == 0) sb.append("(none)\n");
+
+        sb.append("--- app libs ---\n");
+        n = 0;
         for (String l : scan.app) {
             sb.append(l).append("\n");
             if (++n >= 40) { sb.append("...\n"); break; }
@@ -98,10 +95,17 @@ public class GameHook extends AppLifecycleCallback {
                 if (firstSlash < 0 || firstSlash > so) continue;
                 String full = line.substring(firstSlash, so + 3);
                 s.total++;
+
                 if (full.startsWith("/system/") || full.startsWith("/apex/")
                         || full.startsWith("/vendor/") || full.startsWith("/system_ext/")
                         || full.startsWith("/product/") || full.startsWith("/odm/")) continue;
+
                 s.app.add(full.substring(full.lastIndexOf('/') + 1));
+
+                String low = full.toLowerCase();
+                if (low.contains("carrom") || low.contains("libgame-")) {
+                    s.engineLines.add(line.trim());   // keeps address + full path
+                }
             }
         } catch (Throwable t) {
             Log.e(TAG, "scan " + t);
