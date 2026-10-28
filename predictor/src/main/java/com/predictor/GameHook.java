@@ -29,7 +29,7 @@ public class GameHook extends AppLifecycleCallback {
     private static final long OFF_TL       = 0x3f0L;
     private static final long OFF_META     = 0x90L;
 
-    private static final int[][] PAIRS8 = {{45, 46}, {44, 45}, {46, 47}};
+    private static final long[] VOFS = {0x160L, 0x168L, 0x170L};
 
     private static volatile TextView box;
     private static volatile boolean started = false;
@@ -49,12 +49,12 @@ public class GameHook extends AppLifecycleCallback {
         new Thread(() -> {
             final Handler h = new Handler(Looper.getMainLooper());
             h.post(() -> box = addBox(app, "starting..."));
-            for (int i = 0; i < 8; i++) {
-                try { Thread.sleep(15000); } catch (InterruptedException ignored) { }
+            for (int i = 0; i < 24; i++) {
+                try { Thread.sleep(5000); } catch (InterruptedException ignored) { }
                 if (i == 0) continue;
-                String rep = work();
+                String rep = work(i * 5);
                 h.post(() -> { if (box != null) box.setText(rep); });
-                write(app, "v13_report.txt", rep);
+                if (i % 4 == 0) write(app, "v14_report.txt", rep);
             }
         }).start();
     }
@@ -62,10 +62,9 @@ public class GameHook extends AppLifecycleCallback {
     @Override
     public boolean onStoragePermissionNeeded(String packageName, int userId) { return false; }
 
-    private String work() {
+    private String work(int t) {
         StringBuilder sb = new StringBuilder();
-        sb.append("Predictor v13 pid=").append(android.os.Process.myPid())
-          .append(" [").append(readCmdline(android.os.Process.myPid())).append("]\n");
+        sb.append("Predictor v14 t=").append(t).append("s pid=").append(android.os.Process.myPid()).append("\n");
         if (!Mem.open()) { sb.append("MEM FAIL\n"); return sb.toString(); }
 
         List<Mem.Region> regs = Mem.regions();
@@ -102,75 +101,54 @@ public class GameHook extends AppLifecycleCallback {
             }
             if (bias >= 0) break;
         }
-        if (bias < 0) { sb.append("NO MATCH elf=").append(cand.size()).append("\n"); return sb.toString(); }
+        if (bias < 0) { sb.append("NO MATCH\n"); return sb.toString(); }
         long cp = base + OFF_CLASSREC - bias;
-        sb.append("BASE=0x").append(hx(base)).append(" heap=").append(HEAP.size())
-          .append(" malloc=").append(MALLOC.size()).append("\n");
+        sb.append("BASE=0x").append(hx(base)).append(" malloc=").append(MALLOC.size()).append("\n");
 
-        // ---- instances
-        List<long[]> nodes = new ArrayList<>();
-        for (Mem.Region r : HEAP) {
-            scanIsa(r, cp, nodes);
-            if (nodes.size() >= 200) break;
-        }
-        sb.append("isa=").append(nodes.size()).append("\n");
+        List<Long> nodes = new ArrayList<>();
+        for (Mem.Region r : MALLOC) { scanIsa(r, cp, nodes); if (nodes.size() >= 20) break; }
+        sb.append("nodes=").append(nodes.size()).append("\n");
+
         int shown = 0;
-        for (long[] nd : nodes) {
-            long node = nd[0];
+        for (long node : nodes) {
             long tl = Mem.readLong(node + OFF_TL);
-            String tag = tagOf(node);
-            if (!isHeap(tl)) { sb.append("i=0x").append(hx(node)).append(" tl=0x").append(hx(tl))
-                                 .append(" ").append(tag).append("\n"); continue; }
-            long a = Mem.readLong(tl + 0x168);
-            long b = Mem.readLong(tl + 0x170);
-            long n = -1;
-            if (a != 0 && b > a && (b - a) % 32 == 0 && (b - a) / 32 <= 40) n = (b - a) / 32;
-            sb.append("i=0x").append(hx(node)).append(" tl=0x").append(hx(tl))
-              .append(" n=").append(n).append(" ").append(tag).append("\n");
-            if (n > 0 && shown < 2) {
-                byte[] z = Mem.read(tl + 0x100, 128);
-                if (z != null) sb.append("  B").append(hx(z)).append("\n");
-                byte[] rec = Mem.read(a, (int) Math.min(256, n * 32));
-                if (rec != null) sb.append("  C").append(hx(rec)).append("\n");
-                long e = Mem.readLong(a);
-                if (isHeap(e)) {
-                    byte[] eb = Mem.read(e, 64);
-                    if (eb != null) sb.append("  E").append(hx(eb)).append("\n");
-                }
-                shown++;
-            }
-        }
+            sb.append("node=0x").append(hx(node)).append(" tl=0x").append(hx(tl)).append("\n");
+            if (!isHeap(tl)) { shown++; if (shown >= 2) break; continue; }
 
-        // ---- sigs, malloc only
-        List<long[]> sigs = new ArrayList<>();
-        for (Mem.Region r : MALLOC) { scanSig(r, sigs, 120); if (sigs.size() >= 120) break; }
-        sigs.sort((x, y) -> Long.compare(y[2], x[2]));
-        sb.append("sig=").append(sigs.size()).append("\n");
-        int s2 = 0;
-        for (long[] s : sigs) {
-            long tl = s[0];
-            sb.append("s=0x").append(hx(tl)).append(" off=0x").append(hx(s[1]))
-              .append(" n=").append(s[2]).append(" ").append(tagOf(tl)).append("\n");
-            if (s2 < 2) {
-                byte[] z = Mem.read(tl + 0x100, 128);
-                if (z != null) sb.append("  B").append(hx(z)).append("\n");
-                long begin = Mem.readLong(tl + s[1]);
-                byte[] rec = Mem.read(begin, (int) Math.min(256, s[2] * 32));
-                if (rec != null) sb.append("  C").append(hx(rec)).append("\n");
-                long e = Mem.readLong(begin);
-                if (isHeap(e)) {
-                    byte[] eb = Mem.read(e, 64);
-                    if (eb != null) sb.append("  E").append(hx(eb)).append("\n");
+            for (long vo : VOFS) {
+                long a = Mem.readLong(tl + vo);
+                long b = Mem.readLong(tl + vo + 8);
+                long c = Mem.readLong(tl + vo + 16);
+                if (a == 0 || b <= a || !isHeap(a) || !isHeap(b)) continue;
+                long d = b - a;
+                sb.append(" +").append(hx(vo)).append(" a=0x").append(hx(a)).append(" d=0x").append(hx(d))
+                  .append(" /8=").append(d / 8).append(" /16=").append(d / 16)
+                  .append(" /32=").append(d / 32).append(" c=0x").append(hx(c)).append("\n");
+                if (d % 8 == 0 && d / 8 >= 2 && d / 8 <= 40) {
+                    long cnt = d / 8;
+                    for (int i = 0; i < Math.min(cnt, 3); i++) {
+                        long pv = Mem.readLong(a + i * 8L);
+                        sb.append("  p").append(i).append("=0x").append(hx(pv)).append(" ").append(tagOf(pv)).append("\n");
+                        if (isHeap(pv)) {
+                            byte[] pb = Mem.read(pv, 64);
+                            if (pb != null) {
+                                sb.append("   ").append(hx(pb)).append("\n");
+                                sb.append("   f");
+                                for (int k = 0; k < 8; k++) {
+                                    sb.append(" ").append(Float.intBitsToFloat((int) ld(pb, k * 4)));
+                                }
+                                sb.append("\n");
+                            }
+                        }
+                    }
                 }
-                s2++;
             }
-            if (++s2 >= 8 && s2 > 2) { }
-            if (s2 >= 4) break;
+            if (++shown >= 2) break;
         }
         return sb.toString();
     }
 
-    private void scanIsa(Mem.Region r, long cp, List<long[]> out) {
+    private void scanIsa(Mem.Region r, long cp, List<Long> out) {
         long p = r.start;
         while (p + 8 <= r.end) {
             int len = (int) Math.min((long) (1 << 20), r.end - p);
@@ -181,42 +159,7 @@ public class GameHook extends AppLifecycleCallback {
                 int o = k * 8;
                 long x = 0;
                 for (int j = 7; j >= 0; j--) x = (x << 8) | (buf[o + j] & 0xffL);
-                if (x == cp || x == cp - OFF_META) {
-                    if (out.size() < 200) out.add(new long[]{p + o, 0});
-                }
-            }
-            p += len;
-        }
-    }
-
-    private void scanSig(Mem.Region r, List<long[]> out, int cap) {
-        long p = r.start;
-        while (p + 0x200 <= r.end) {
-            int len = (int) Math.min((long) (1 << 20), r.end - p);
-            byte[] buf = Mem.read(p, len);
-            if (buf == null || buf.length < 0x200) { p += len; continue; }
-            int n8 = buf.length / 8;
-            long[] v = new long[n8];
-            for (int k = 0; k < n8; k++) {
-                int o = k * 8;
-                long x = 0;
-                for (int j = 7; j >= 0; j--) x = (x << 8) | (buf[o + j] & 0xffL);
-                v[k] = x;
-            }
-            for (int k = 0; k + 48 <= n8; k++) {
-                for (int pi = 0; pi < PAIRS8.length; pi++) {
-                    long a = v[k + PAIRS8[pi][0]];
-                    long b = v[k + PAIRS8[pi][1]];
-                    long c = v[k + PAIRS8[pi][1] + 1];
-                    if (a == 0 || b <= a || c < b) continue;
-                    long d = b - a;
-                    if ((d & 31) != 0 || d > 1280) continue;
-                    if ((c - a) > 2048) continue;
-                    int ra = regionOf(a);
-                    if (ra < 0 || regionOf(c) != ra) continue;
-                    out.add(new long[]{p + k * 8L, PAIRS8[pi][0] * 8L, d / 32});
-                    if (out.size() >= cap) return;
-                }
+                if (x == cp || x == cp - OFF_META) { if (out.size() < 20) out.add(p + o); }
             }
             p += len;
         }
