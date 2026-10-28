@@ -16,7 +16,13 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileReader;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
 
 import top.niunaijun.blackbox.app.configuration.AppLifecycleCallback;
@@ -32,7 +38,6 @@ public class GameHook extends AppLifecycleCallback {
     @Override
     public void afterApplicationOnCreate(String packageName, String processName,
                                          Application application, int userId) {
-        Log.d(TAG, "hook pkg=" + packageName + " proc=" + processName);
         if (!GAME.equals(packageName) || application == null) return;
         if (started) return;
         started = true;
@@ -41,7 +46,7 @@ public class GameHook extends AppLifecycleCallback {
         new Thread(() -> {
             final Handler h = new Handler(Looper.getMainLooper());
             h.post(() -> box = addBox(app, "starting..."));
-            for (int i = 0; i < 300; i++) {                 // up to 5 min, live
+            for (int i = 0; i < 300; i++) {
                 final String s = snapshot(i + 1);
                 h.post(() -> { if (box != null) box.setText(s); });
                 if (s.contains("CARROM=1")) break;
@@ -63,13 +68,14 @@ public class GameHook extends AppLifecycleCallback {
 
     private String snapshot(int t) {
         StringBuilder sb = new StringBuilder();
-        sb.append("Predictor v6  t=").append(t).append("s\n");
-        sb.append("pid=").append(android.os.Process.myPid())
-          .append(" [").append(readCmdline(android.os.Process.myPid())).append("]\n");
+        sb.append("Predictor v7 t=").append(t).append("s\n");
+        int myPid = android.os.Process.myPid();
+        sb.append("pid=").append(myPid).append(" [").append(readCmdline(myPid)).append("]\n");
 
-        int total = 0, soLines = 0, carrom = 0;
+        int total = 0, soLines = 0, dataSo = 0, carrom = 0;
         Set<String> names = new TreeSet<>();
         Set<String> carromLines = new TreeSet<>();
+        Map<String, Integer> pref = new TreeMap<>();
 
         try (BufferedReader r = new BufferedReader(new FileReader("/proc/self/maps"))) {
             String line;
@@ -81,20 +87,30 @@ public class GameHook extends AppLifecycleCallback {
                 int slash = line.indexOf('/');
                 if (slash < 0) continue;
                 String path = line.substring(slash, so + 3);
+
+                if (path.startsWith("/data/")) dataSo++;
+
                 String low = path.toLowerCase();
                 if (low.contains("carrom") || low.contains("libgame")) {
                     carrom++;
                     carromLines.add(line.trim());
                 }
-                if (!isSystem(path)) {
-                    names.add(path.substring(path.lastIndexOf('/') + 1));
+                if (!isSystem(path)) names.add(path.substring(path.lastIndexOf('/') + 1));
+
+                int c = 0, cut = path.length();
+                for (int k = 0; k < path.length(); k++) {
+                    if (path.charAt(k) == '/') { c++; if (c == 4) { cut = k; break; } }
                 }
+                String p = path.substring(0, cut);
+                Integer v = pref.get(p);
+                pref.put(p, v == null ? 1 : v + 1);
             }
         } catch (Throwable e) {
-            sb.append("self err ").append(e).append("\n");
+            sb.append("err ").append(e).append("\n");
         }
 
-        sb.append("self lines=").append(total).append(" so=").append(soLines).append("\n");
+        sb.append("lines=").append(total).append(" so=").append(soLines)
+          .append(" dataSo=").append(dataSo).append("\n");
         sb.append("nonSys=").append(names.size())
           .append(" CARROM=").append(carrom > 0 ? 1 : 0).append("\n");
 
@@ -103,7 +119,20 @@ public class GameHook extends AppLifecycleCallback {
 
         sb.append("-- names --\n");
         n = 0;
-        for (String l : names) { sb.append(l).append("\n"); if (++n >= 12) break; }
+        for (String l : names) { sb.append(l).append("\n"); if (++n >= 10) break; }
+
+        sb.append("-- prefixes --\n");
+        List<Map.Entry<String, Integer>> lst = new ArrayList<>(pref.entrySet());
+        Collections.sort(lst, new Comparator<Map.Entry<String, Integer>>() {
+            public int compare(Map.Entry<String, Integer> a, Map.Entry<String, Integer> b) {
+                return b.getValue() - a.getValue();
+            }
+        });
+        n = 0;
+        for (Map.Entry<String, Integer> e : lst) {
+            sb.append(e.getValue()).append(" ").append(e.getKey()).append("\n");
+            if (++n >= 10) break;
+        }
 
         sb.append("-- procs --\n");
         File[] dirs = new File("/proc").listFiles();
@@ -149,10 +178,10 @@ public class GameHook extends AppLifecycleCallback {
             WindowManager wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
             TextView tv = new TextView(ctx);
             tv.setText(text);
-            tv.setTextSize(8f);
+            tv.setTextSize(7.5f);
             tv.setTextColor(Color.WHITE);
             tv.setBackgroundColor(0xaa000000);
-            tv.setPadding(14, 14, 14, 14);
+            tv.setPadding(12, 12, 12, 12);
 
             int type = Build.VERSION.SDK_INT >= 26
                     ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
