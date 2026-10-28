@@ -15,7 +15,9 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileWriter;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import top.niunaijun.blackbox.app.configuration.AppLifecycleCallback;
 
@@ -27,13 +29,16 @@ public class GameHook extends AppLifecycleCallback {
     private static final long OFF_CLASSREC = 0x02a6f2a0L;
     private static final long OFF_NAMEPTR  = 0x02a6f2b0L;
     private static final long OFF_TL_IN_NODE = 0x3f0L;
+    private static final long OFF_META = 0x90L;
 
-    // vector{begin,end} candidate offsets, as 8-byte indexes
     private static final int[][] PAIRS8 = {{45, 46}, {44, 45}, {46, 47}};
 
     private static volatile TextView box;
     private static volatile boolean started = false;
     private static List<Mem.Region> HEAP = new ArrayList<>();
+    private static List<Mem.Region> MALLOC = new ArrayList<>();
+    private static long[] RS = new long[0];
+    private static long[] RE = new long[0];
 
     @Override
     public void afterApplicationOnCreate(String packageName, String processName,
@@ -46,12 +51,12 @@ public class GameHook extends AppLifecycleCallback {
         new Thread(() -> {
             final Handler h = new Handler(Looper.getMainLooper());
             h.post(() -> box = addBox(app, "starting..."));
-            for (int i = 0; i < 12; i++) {
-                try { Thread.sleep(10000); } catch (InterruptedException ignored) { }
-                if (i < 2) continue;
+            for (int i = 0; i < 8; i++) {
+                try { Thread.sleep(15000); } catch (InterruptedException ignored) { }
+                if (i == 0) continue;
                 String rep = work();
                 h.post(() -> { if (box != null) box.setText(rep); });
-                write(app, "v11_report.txt", rep);
+                write(app, "v12_report.txt", rep);
             }
         }).start();
     }
@@ -61,20 +66,27 @@ public class GameHook extends AppLifecycleCallback {
 
     private String work() {
         StringBuilder sb = new StringBuilder();
-        sb.append("Predictor v11 pid=").append(android.os.Process.myPid())
+        sb.append("Predictor v12 pid=").append(android.os.Process.myPid())
           .append(" [").append(readCmdline(android.os.Process.myPid())).append("]\n");
         if (!Mem.open()) { sb.append("MEM FAIL\n"); return sb.toString(); }
 
         List<Mem.Region> regs = Mem.regions();
         HEAP = new ArrayList<>();
+        MALLOC = new ArrayList<>();
         List<Mem.Region> apk = new ArrayList<>();
         for (Mem.Region r : regs) {
-            if (r.rw() && !r.path.contains("/")
-                    && !r.path.startsWith("[stack") && !r.path.startsWith("[vvar")
-                    && !r.path.startsWith("[vsys")) HEAP.add(r);
             if (r.read() && r.path.startsWith(APK_MARK) && r.path.endsWith(".apk")) apk.add(r);
+            if (!r.rw()) continue;
+            String p = r.path;
+            if (p.startsWith("[stack") || p.startsWith("[vvar") || p.startsWith("[vsys")) continue;
+            if (p.contains(".art") || p.contains(".oat") || p.contains(".vdex") || p.contains(".dex")) continue;
+            if (p.contains("jit-cache")) continue;
+            HEAP.add(r);
+            if (p.contains("malloc") || p.contains("scudo")) MALLOC.add(r);
         }
-        sb.append("apk=").append(apk.size()).append(" heap=").append(HEAP.size()).append("\n");
+        RS = new long[HEAP.size()];
+        RE = new long[HEAP.size()];
+        for (int i = 0; i < HEAP.size(); i++) { RS[i] = HEAP.get(i).start; RE[i] = HEAP.get(i).end; }
 
         List<Mem.Region> cand = new ArrayList<>();
         for (Mem.Region r : apk) {
@@ -95,93 +107,133 @@ public class GameHook extends AppLifecycleCallback {
         if (bias < 0) { sb.append("NO MATCH elf=").append(cand.size()).append("\n"); return sb.toString(); }
 
         long cp = base + OFF_CLASSREC - bias;
-        sb.append("BASE=0x").append(hx(base)).append(" BIAS=0x").append(hx(bias)).append("\n");
-        sb.append("rec=0x").append(hx(cp)).append("\n");
-
-        byte[] rb = Mem.read(cp, 64);
+        sb.append("BASE=0x").append(hx(base)).append(" heap=").append(HEAP.size())
+          .append(" malloc=").append(MALLOC.size()).append("\n");
+        byte[] rb = Mem.read(cp, 48);
         if (rb != null) {
-            sb.append(hx(rb, 0, 32)).append("\n");
-            sb.append(hx(rb, 32, 32)).append("\n");
+            sb.append("instsz=0x").append(hx(ld(rb, 0x28)))
+              .append(" super=0x").append(hx(ld(rb, 8))).append("\n");
+            long sp = ld(rb, 8);
+            if (sp != 0) sb.append("superName=").append(Mem.readCstr(Mem.readLong(sp + 0x10), 24)).append("\n");
         }
-        sb.append("super=0x").append(hx(Mem.readLong(cp + 8))).append("\n");
 
-        List<Long> hits = new ArrayList<>();
-        List<long[]> sigs = new ArrayList<>();
-        long scanned = 0;
-
-        outer:
+        List<Long> isa = new ArrayList<>();
+        Map<Long, Integer> band = new HashMap<>();
         for (Mem.Region r : HEAP) {
-            long p = r.start;
-            while (p + 0x200 <= r.end) {
-                int len = (int) Math.min((long) (1 << 20), r.end - p);
-                byte[] buf = Mem.read(p, len);
-                if (buf == null || buf.length < 0x200) { p += len; continue; }
-
-                int n8 = buf.length / 8;
-                long[] v = new long[n8];
-                for (int k = 0; k < n8; k++) {
-                    int o = k * 8;
-                    long x = 0;
-                    for (int j = 7; j >= 0; j--) x = (x << 8) | (buf[o + j] & 0xffL);
-                    v[k] = x;
-                    if (x == cp && hits.size() < 64) hits.add(p + o);
-                }
-                for (int k = 0; k + 48 <= n8; k++) {
-                    for (int pi = 0; pi < PAIRS8.length; pi++) {
-                        long a = v[k + PAIRS8[pi][0]];
-                        long b = v[k + PAIRS8[pi][1]];
-                        if (a == 0 || b <= a) continue;
-                        long d = b - a;
-                        if ((d & 31) != 0 || d > 1280) continue;
-                        if (!isHeap(a) || !isHeap(b)) continue;
-                        sigs.add(new long[]{p + k * 8L, PAIRS8[pi][0] * 8L, d / 32});
-                        if (sigs.size() >= 200) break outer;
-                    }
-                }
-                p += len;
-            }
-            scanned += r.size();
-            if (scanned > (1500L << 20)) break;
+            scan(r, cp, isa, null, 0, band);
+            if (isa.size() >= 200) break;
         }
-
-        sb.append("isaHits=").append(hits.size()).append("\n");
-        int shown = 0;
-        for (long node : hits) {
+        sb.append("isaExact=").append(isa.size()).append("\n");
+        int n = 0;
+        for (long node : isa) {
             long tl = Mem.readLong(node + OFF_TL_IN_NODE);
             sb.append("n=0x").append(hx(node)).append(" t3f0=0x").append(hx(tl)).append("\n");
-            if (tl != 0 && isHeap(tl) && shown < 2) {
-                byte[] z = Mem.read(tl + 0x140, 64);
+            if (n < 3) {
+                byte[] z = Mem.read(node + 0x3c0, 64);
                 if (z != null) sb.append("  ").append(hx(z)).append("\n");
+                if (isHeap(tl)) {
+                    byte[] y = Mem.read(tl + 0x140, 96);
+                    if (y != null) sb.append("  T").append(hx(y)).append("\n");
+                }
             }
-            shown++;
-            if (shown >= 5) break;
+            n++;
+            if (n >= 5) break;
+        }
+        sb.append("band:\n");
+        int bn = 0;
+        for (Map.Entry<Long, Integer> e : band.entrySet()) {
+            sb.append(" 0x").append(hx(e.getKey())).append(" x").append(e.getValue()).append("\n");
+            bn++;
+            if (bn >= 6) break;
         }
 
-        sb.append("sig=").append(sigs.size()).append("\n");
+        List<long[]> sigs = new ArrayList<>();
+        for (Mem.Region r : MALLOC) { scan(r, cp, null, sigs, 60, null); if (sigs.size() >= 60) break; }
+        int fromM = sigs.size();
+        if (sigs.size() < 3) {
+            for (Mem.Region r : HEAP) { scan(r, cp, null, sigs, 100, null); if (sigs.size() >= 100) break; }
+        }
+        sb.append("sig=").append(sigs.size()).append(" mallocSig=").append(fromM).append("\n");
         int s2 = 0;
         for (long[] s : sigs) {
             long tl = s[0];
-            byte[] rec1 = Mem.read(tl + s[1], 32);
-            sb.append("s=0x").append(hx(tl)).append(" off=0x").append(hx(s[1]))
-              .append(" n=").append(s[2]).append("\n");
-            if (rec1 != null && s2 < 2) {
-                sb.append("  r=").append(hx(rec1)).append("\n");
-                long e = ld(rec1, 0);
-                if (isHeap(e)) {
-                    byte[] eb = Mem.read(e, 48);
-                    if (eb != null) sb.append("  e=0x").append(hx(e)).append(" ").append(hx(eb)).append("\n");
+            long begin = Mem.readLong(tl + s[1]);
+            sb.append("s=0x").append(hx(tl)).append(" off=0x").append(hx(s[1])).append(" n=").append(s[2]).append("\n");
+            if (s2 < 3) {
+                byte[] rec = Mem.read(begin, 32);
+                if (rec != null) {
+                    sb.append("  r=").append(hx(rec)).append("\n");
+                    long e = ld(rec, 0);
+                    if (isHeap(e)) {
+                        byte[] eb = Mem.read(e, 64);
+                        if (eb != null) sb.append("  e=0x").append(hx(e)).append(" ").append(hx(eb)).append("\n");
+                    }
                 }
             }
             s2++;
-            if (s2 >= 4) break;
+            if (s2 >= 5) break;
         }
         return sb.toString();
     }
 
-    private static boolean isHeap(long v) {
-        for (Mem.Region r : HEAP) if (v >= r.start && v < r.end) return true;
-        return false;
+    private void scan(Mem.Region r, long cp, List<Long> isa, List<long[]> sigs, int sigCap, Map<Long, Integer> band) {
+        long p = r.start;
+        while (p + 0x200 <= r.end) {
+            int len = (int) Math.min((long) (1 << 20), r.end - p);
+            byte[] buf = Mem.read(p, len);
+            if (buf == null || buf.length < 0x200) { p += len; continue; }
+            int n8 = buf.length / 8;
+            long[] v = new long[n8];
+            for (int k = 0; k < n8; k++) {
+                int o = k * 8;
+                long x = 0;
+                for (int j = 7; j >= 0; j--) x = (x << 8) | (buf[o + j] & 0xffL);
+                v[k] = x;
+            }
+            if (isa != null || band != null) {
+                for (int k = 0; k < n8; k++) {
+                    long x = v[k];
+                    if (x == cp || x == cp - OFF_META) {
+                        if (isa != null && isa.size() < 200) isa.add(p + k * 8L);
+                    } else if (band != null && x >= cp - 0x200 && x <= cp + 0x200) {
+                        Integer c = band.get(x);
+                        band.put(x, c == null ? 1 : c + 1);
+                    }
+                }
+            }
+            if (sigs != null && sigs.size() < sigCap) {
+                for (int k = 0; k + 48 <= n8; k++) {
+                    for (int pi = 0; pi < PAIRS8.length; pi++) {
+                        long a = v[k + PAIRS8[pi][0]];
+                        long b = v[k + PAIRS8[pi][1]];
+                        long c = v[k + PAIRS8[pi][1] + 1];
+                        if (a == 0 || b <= a || c < b) continue;
+                        long d = b - a;
+                        if ((d & 31) != 0 || d > 1280) continue;
+                        if ((c - a) > 2048) continue;
+                        int ra = regionOf(a);
+                        if (ra < 0 || regionOf(c) != ra) continue;
+                        sigs.add(new long[]{p + k * 8L, PAIRS8[pi][0] * 8L, d / 32});
+                        if (sigs.size() >= sigCap) break;
+                    }
+                    if (sigs.size() >= sigCap) break;
+                }
+            }
+            p += len;
+        }
     }
+
+    private static int regionOf(long v) {
+        int lo = 0, hi = RS.length - 1, ans = -1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            if (RS[mid] <= v) { ans = mid; lo = mid + 1; } else hi = mid - 1;
+        }
+        if (ans < 0) return -1;
+        return (v < RE[ans]) ? ans : -1;
+    }
+
+    private static boolean isHeap(long v) { return regionOf(v) >= 0; }
 
     private static long ld(byte[] b, int o) {
         long v = 0;
