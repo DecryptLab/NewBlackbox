@@ -7,15 +7,12 @@ import android.graphics.PixelFormat;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
-import android.util.Log;
 import android.view.Gravity;
 import android.view.WindowManager;
 import android.widget.TextView;
 
-import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileReader;
 import java.io.FileWriter;
 import java.util.ArrayList;
 import java.util.List;
@@ -24,15 +21,26 @@ import top.niunaijun.blackbox.app.configuration.AppLifecycleCallback;
 
 public class GameHook extends AppLifecycleCallback {
 
-    private static final String TAG = "PredictorHook";
     private static final String GAME = "com.miniclip.carrom";
+    private static final String APK_MARK = "/data/app/com.miniclip.carrom-";
+
+    // Ghidra vaddrs (Antigravity, image base 0x00100000)
+    private static final long OFF_INIT     = 0x01bf7bc8L;   // -[TableNode init]
+    private static final long OFF_CLASSREC = 0x02a6f2a0L;   // objc_class record
+    private static final long OFF_NAMEPTR  = 0x02a6f2b0L;   // -> "TableNode"
+    private static final long OFF_NAMESTR  = 0x0135a61dL;   // "TableNode" bytes
+    private static final long OFF_TL_IN_NODE = 0x3f0L;      // TableNode -> TableLogic
+    private static final long OFF_PUCKS_A  = 0x168L;
+    private static final long OFF_PUCKS_B  = 0x170L;
+
+    private static final long STP_X22_X21  = 0xA9BD57F6L;   // stp x22,x21,[sp,#-0x30]!
+
     private static volatile TextView box;
     private static volatile boolean started = false;
 
     @Override
     public void afterApplicationOnCreate(String packageName, String processName,
                                          Application application, int userId) {
-        Log.d(TAG, "hook pkg=" + packageName + " proc=" + processName);
         if (!GAME.equals(packageName) || application == null) return;
         if (started) return;
         started = true;
@@ -41,11 +49,12 @@ public class GameHook extends AppLifecycleCallback {
         new Thread(() -> {
             final Handler h = new Handler(Looper.getMainLooper());
             h.post(() -> box = addBox(app, "starting..."));
-            for (int t = 1; t <= 120; t++) {
-                final String s = report();
-                h.post(() -> { if (box != null) box.setText(s); });
-                if (t % 10 == 0) dump(app);
-                try { Thread.sleep(1500); } catch (InterruptedException ignored) { }
+            for (int i = 0; i < 12; i++) {
+                try { Thread.sleep(10000); } catch (InterruptedException ignored) { }
+                if (i < 2) continue;
+                String rep = work();
+                h.post(() -> { if (box != null) box.setText(rep); });
+                write(app, "v10_report.txt", rep);
             }
         }).start();
     }
@@ -53,89 +62,118 @@ public class GameHook extends AppLifecycleCallback {
     @Override
     public boolean onStoragePermissionNeeded(String packageName, int userId) { return false; }
 
-    private String report() {
-        int lines = 0, dataLines = 0, apkLines = 0, carrom = 0, libgame = 0, blackbox = 0;
-        List<String> dataSamples = new ArrayList<>();
-        List<String> keySamples = new ArrayList<>();
-
-        try (BufferedReader r = new BufferedReader(new FileReader("/proc/self/maps"))) {
-            String line;
-            while ((line = r.readLine()) != null) {
-                lines++;
-                String low = line.toLowerCase();
-                if (low.contains("/data/")) { dataLines++; if (dataSamples.size() < 12) dataSamples.add(shorten(line)); }
-                if (low.contains(".apk")) apkLines++;
-                if (low.contains("carrom")) carrom++;
-                if (low.contains("libgame")) libgame++;
-                if (low.contains("blackbox")) blackbox++;
-                if ((low.contains("carrom") || low.contains("libgame")
-                        || low.contains("libblackbox") || low.contains(".apk"))
-                        && keySamples.size() < 8) keySamples.add(shorten(line));
-            }
-        } catch (Throwable t) { }
-
+    private String work() {
         StringBuilder sb = new StringBuilder();
-        sb.append("Predictor v9\n");
-        sb.append("pid=").append(android.os.Process.myPid())
+        sb.append("Predictor v10\npid=").append(android.os.Process.myPid())
           .append(" [").append(readCmdline(android.os.Process.myPid())).append("]\n");
-        sb.append("lines=").append(lines).append("\n");
-        sb.append("data=").append(dataLines).append(" apk=").append(apkLines).append("\n");
-        sb.append("carrom=").append(carrom).append(" libgame=").append(libgame)
-          .append(" bb=").append(blackbox).append("\n");
-        sb.append("-- key --\n");
-        for (String s : keySamples) sb.append(s).append("\n");
-        sb.append("-- data --\n");
-        for (String s : dataSamples) sb.append(s).append("\n");
+
+        if (!Mem.open()) { sb.append("MEM OPEN FAIL\n"); return sb.toString(); }
+
+        List<Mem.Region> regs = Mem.regions();
+        List<Mem.Region> apk = new ArrayList<>();
+        for (Mem.Region r : regs) {
+            if (r.read() && r.path.startsWith(APK_MARK) && r.path.endsWith(".apk")) apk.add(r);
+        }
+        sb.append("apkRegions=").append(apk.size()).append("\n");
+
+        List<Mem.Region> cand = new ArrayList<>();
+        for (Mem.Region r : apk) {
+            byte[] m = Mem.read(r.start, 4);
+            if (m != null && m.length == 4 && (m[0] & 0xff) == 0x7f
+                    && m[1] == 'E' && m[2] == 'L' && m[3] == 'F') cand.add(r);
+        }
+        sb.append("elfBases=").append(cand.size()).append("\n");
+        if (cand.isEmpty()) { sb.append("NO ELF BASE FOUND\n"); return sb.toString(); }
+
+        long base = 0, bias = -1;
+        for (Mem.Region c : cand) {
+            for (long b : new long[]{0L, 0x100000L}) {
+                long a = c.start + OFF_NAMEPTR - b;
+                long p = Mem.readLong(a);
+                if (p == 0) continue;
+                String s = Mem.readCstr(p, 16);
+                if ("TableNode".equals(s)) { base = c.start; bias = b; break; }
+            }
+            if (bias >= 0) break;
+        }
+        sb.append("candScanned=").append(cand.size()).append("\n");
+        if (bias < 0) { sb.append("NO TableNode MATCH\n"); return sb.toString(); }
+
+        sb.append("BASE=0x").append(Long.toHexString(base)).append("\n");
+        sb.append("BIAS=0x").append(Long.toHexString(bias)).append("\n");
+
+        byte[] ini = Mem.read(base + OFF_INIT - bias, 4);
+        sb.append("init=").append(ini == null ? "----" : Long.toHexString(Mem.u32(ini, 0)))
+          .append(Mem.u32(ini, 0) == STP_X22_X21 ? " OK" : " ?").append("\n");
+
+        long cp = base + OFF_CLASSREC - bias;
+        sb.append("classPtr=0x").append(Long.toHexString(cp)).append("\n");
+
+        List<Mem.Region> heap = new ArrayList<>();
+        for (Mem.Region r : regs) {
+            if (!r.rw()) continue;
+            if (r.path.contains("/")) continue;
+            if (r.path.startsWith("[stack") || r.path.startsWith("[vvar") || r.path.startsWith("[vsys")) continue;
+            heap.add(r);
+        }
+
+        List<Long> hits = new ArrayList<>();
+        long scanned = 0;
+        for (Mem.Region r : heap) {
+            String p = r.path;
+            if (!(p.contains("malloc") || p.contains("scudo") || p.contains("dalvik-alloc") || p.contains("dalvik-main"))) continue;
+            hits.addAll(Mem.scan(r.start, r.end, cp, 300));
+            scanned += r.size();
+            if (hits.size() >= 300) break;
+        }
+        if (hits.isEmpty()) {
+            for (Mem.Region r : heap) {
+                hits.addAll(Mem.scan(r.start, r.end, cp, 300));
+                scanned += r.size();
+                if (hits.size() >= 300 || scanned > (1200L << 20)) break;
+            }
+        }
+        sb.append("scanned=").append(scanned / (1024 * 1024)).append("MB hits=").append(hits.size()).append("\n");
+
+        int shown = 0;
+        for (long node : hits) {
+            long tl = Mem.readLong(node + OFF_TL_IN_NODE);
+            if (tl == 0) continue;
+            long a = Mem.readLong(tl + OFF_PUCKS_A);
+            long b2 = Mem.readLong(tl + OFF_PUCKS_B);
+            long n = -1;
+            if (a != 0 && b2 > a && (b2 - a) % 32 == 0 && (b2 - a) / 32 <= 60) n = (b2 - a) / 32;
+            else if (b2 > 0 && b2 <= 60) n = b2;
+            if (n <= 0) continue;
+            sb.append("#").append(shown).append(" node=0x").append(Long.toHexString(node))
+              .append(" tl=0x").append(Long.toHexString(tl)).append(" n=").append(n).append("\n");
+            byte[] rec = Mem.read(a, (int) Math.min(96, n * 32));
+            if (rec != null) sb.append("  rec=").append(hex(rec)).append("\n");
+            shown++;
+            if (shown >= 5) break;
+        }
+        if (shown == 0) sb.append("no valid TableNode instance\n");
         return sb.toString();
     }
 
-    private String shorten(String line) {
-        if (line.length() <= 118) return line;
-        int slash = line.indexOf('/');
-        if (slash < 0) return line.substring(0, 118);
-        String head = line.substring(0, 20);
-        String path = line.substring(slash);
-        if (path.length() > 95) path = "..." + path.substring(path.length() - 92);
-        return head + " " + path;
+    private static String hex(byte[] b) {
+        StringBuilder s = new StringBuilder(b.length * 2);
+        for (byte x : b) {
+            int v = x & 0xff;
+            s.append(Character.forDigit(v >> 4, 16)).append(Character.forDigit(v & 15, 16));
+        }
+        return s.toString();
     }
 
-    private void dump(Application app) {
+    private void write(Application app, String name, String text) {
         try {
-            File dir = app.getExternalFilesDir(null);
-            if (dir == null) dir = app.getFilesDir();
-            if (!dir.exists()) dir.mkdirs();
-
-            StringBuilder self = new StringBuilder();
-            try (BufferedReader r = new BufferedReader(new FileReader("/proc/self/maps"))) {
-                String line;
-                while ((line = r.readLine()) != null) self.append(line).append("\n");
-            }
-            write(new File(dir, "self_maps.txt"), self.toString());
-
-            StringBuilder all = new StringBuilder();
-            File[] dirs = new File("/proc").listFiles();
-            if (dirs != null) {
-                for (File f : dirs) {
-                    String nm = f.getName();
-                    if (!nm.matches("\\d+")) continue;
-                    int pid;
-                    try { pid = Integer.parseInt(nm); } catch (Exception e) { continue; }
-                    StringBuilder one = new StringBuilder();
-                    try (BufferedReader r = new BufferedReader(new FileReader("/proc/" + pid + "/maps"))) {
-                        String line;
-                        while ((line = r.readLine()) != null) one.append(line).append("\n");
-                    } catch (Throwable t) { continue; }
-                    if (one.length() == 0) continue;
-                    all.append("=== pid ").append(pid).append(" [")
-                       .append(readCmdline(pid)).append("] ===\n").append(one);
-                }
-            }
-            write(new File(dir, "all_maps.txt"), all.toString());
-        } catch (Throwable t) { Log.e(TAG, "dump " + t); }
-    }
-
-    private void write(File f, String s) {
-        try (FileWriter w = new FileWriter(f, false)) { w.write(s); } catch (Throwable t) { }
+            File d = app.getExternalFilesDir(null);
+            if (d == null) d = app.getFilesDir();
+            if (!d.exists()) d.mkdirs();
+            FileWriter w = new FileWriter(new File(d, name), false);
+            w.write(text);
+            w.close();
+        } catch (Throwable ignored) { }
     }
 
     private String readCmdline(int pid) {
@@ -154,7 +192,7 @@ public class GameHook extends AppLifecycleCallback {
             WindowManager wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
             TextView tv = new TextView(ctx);
             tv.setText(text);
-            tv.setTextSize(7.5f);
+            tv.setTextSize(7f);
             tv.setTextColor(Color.WHITE);
             tv.setBackgroundColor(0xcc000000);
             tv.setPadding(12, 12, 12, 12);
@@ -173,6 +211,6 @@ public class GameHook extends AppLifecycleCallback {
             lp.y = 60;
             wm.addView(tv, lp);
             return tv;
-        } catch (Throwable t) { Log.e(TAG, "addBox " + t); return null; }
+        } catch (Throwable t) { return null; }
     }
 }
