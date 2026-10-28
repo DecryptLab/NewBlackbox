@@ -24,19 +24,16 @@ public class GameHook extends AppLifecycleCallback {
     private static final String GAME = "com.miniclip.carrom";
     private static final String APK_MARK = "/data/app/com.miniclip.carrom-";
 
-    // Ghidra vaddrs (Antigravity, image base 0x00100000)
-    private static final long OFF_INIT     = 0x01bf7bc8L;   // -[TableNode init]
-    private static final long OFF_CLASSREC = 0x02a6f2a0L;   // objc_class record
-    private static final long OFF_NAMEPTR  = 0x02a6f2b0L;   // -> "TableNode"
-    private static final long OFF_NAMESTR  = 0x0135a61dL;   // "TableNode" bytes
-    private static final long OFF_TL_IN_NODE = 0x3f0L;      // TableNode -> TableLogic
-    private static final long OFF_PUCKS_A  = 0x168L;
-    private static final long OFF_PUCKS_B  = 0x170L;
+    private static final long OFF_CLASSREC = 0x02a6f2a0L;
+    private static final long OFF_NAMEPTR  = 0x02a6f2b0L;
+    private static final long OFF_TL_IN_NODE = 0x3f0L;
 
-    private static final long STP_X22_X21  = 0xA9BD57F6L;   // stp x22,x21,[sp,#-0x30]!
+    // vector{begin,end} candidate offsets, as 8-byte indexes
+    private static final int[][] PAIRS8 = {{45, 46}, {44, 45}, {46, 47}};
 
     private static volatile TextView box;
     private static volatile boolean started = false;
+    private static List<Mem.Region> HEAP = new ArrayList<>();
 
     @Override
     public void afterApplicationOnCreate(String packageName, String processName,
@@ -54,7 +51,7 @@ public class GameHook extends AppLifecycleCallback {
                 if (i < 2) continue;
                 String rep = work();
                 h.post(() -> { if (box != null) box.setText(rep); });
-                write(app, "v10_report.txt", rep);
+                write(app, "v11_report.txt", rep);
             }
         }).start();
     }
@@ -64,17 +61,20 @@ public class GameHook extends AppLifecycleCallback {
 
     private String work() {
         StringBuilder sb = new StringBuilder();
-        sb.append("Predictor v10\npid=").append(android.os.Process.myPid())
+        sb.append("Predictor v11 pid=").append(android.os.Process.myPid())
           .append(" [").append(readCmdline(android.os.Process.myPid())).append("]\n");
-
-        if (!Mem.open()) { sb.append("MEM OPEN FAIL\n"); return sb.toString(); }
+        if (!Mem.open()) { sb.append("MEM FAIL\n"); return sb.toString(); }
 
         List<Mem.Region> regs = Mem.regions();
+        HEAP = new ArrayList<>();
         List<Mem.Region> apk = new ArrayList<>();
         for (Mem.Region r : regs) {
+            if (r.rw() && !r.path.contains("/")
+                    && !r.path.startsWith("[stack") && !r.path.startsWith("[vvar")
+                    && !r.path.startsWith("[vsys")) HEAP.add(r);
             if (r.read() && r.path.startsWith(APK_MARK) && r.path.endsWith(".apk")) apk.add(r);
         }
-        sb.append("apkRegions=").append(apk.size()).append("\n");
+        sb.append("apk=").append(apk.size()).append(" heap=").append(HEAP.size()).append("\n");
 
         List<Mem.Region> cand = new ArrayList<>();
         for (Mem.Region r : apk) {
@@ -82,85 +82,124 @@ public class GameHook extends AppLifecycleCallback {
             if (m != null && m.length == 4 && (m[0] & 0xff) == 0x7f
                     && m[1] == 'E' && m[2] == 'L' && m[3] == 'F') cand.add(r);
         }
-        sb.append("elfBases=").append(cand.size()).append("\n");
-        if (cand.isEmpty()) { sb.append("NO ELF BASE FOUND\n"); return sb.toString(); }
 
         long base = 0, bias = -1;
         for (Mem.Region c : cand) {
             for (long b : new long[]{0L, 0x100000L}) {
-                long a = c.start + OFF_NAMEPTR - b;
-                long p = Mem.readLong(a);
+                long p = Mem.readLong(c.start + OFF_NAMEPTR - b);
                 if (p == 0) continue;
-                String s = Mem.readCstr(p, 16);
-                if ("TableNode".equals(s)) { base = c.start; bias = b; break; }
+                if ("TableNode".equals(Mem.readCstr(p, 16))) { base = c.start; bias = b; break; }
             }
             if (bias >= 0) break;
         }
-        sb.append("candScanned=").append(cand.size()).append("\n");
-        if (bias < 0) { sb.append("NO TableNode MATCH\n"); return sb.toString(); }
-
-        sb.append("BASE=0x").append(Long.toHexString(base)).append("\n");
-        sb.append("BIAS=0x").append(Long.toHexString(bias)).append("\n");
-
-        byte[] ini = Mem.read(base + OFF_INIT - bias, 4);
-        sb.append("init=").append(ini == null ? "----" : Long.toHexString(Mem.u32(ini, 0)))
-          .append(Mem.u32(ini, 0) == STP_X22_X21 ? " OK" : " ?").append("\n");
+        if (bias < 0) { sb.append("NO MATCH elf=").append(cand.size()).append("\n"); return sb.toString(); }
 
         long cp = base + OFF_CLASSREC - bias;
-        sb.append("classPtr=0x").append(Long.toHexString(cp)).append("\n");
+        sb.append("BASE=0x").append(hx(base)).append(" BIAS=0x").append(hx(bias)).append("\n");
+        sb.append("rec=0x").append(hx(cp)).append("\n");
 
-        List<Mem.Region> heap = new ArrayList<>();
-        for (Mem.Region r : regs) {
-            if (!r.rw()) continue;
-            if (r.path.contains("/")) continue;
-            if (r.path.startsWith("[stack") || r.path.startsWith("[vvar") || r.path.startsWith("[vsys")) continue;
-            heap.add(r);
+        byte[] rb = Mem.read(cp, 64);
+        if (rb != null) {
+            sb.append(hx(rb, 0, 32)).append("\n");
+            sb.append(hx(rb, 32, 32)).append("\n");
         }
+        sb.append("super=0x").append(hx(Mem.readLong(cp + 8))).append("\n");
 
         List<Long> hits = new ArrayList<>();
+        List<long[]> sigs = new ArrayList<>();
         long scanned = 0;
-        for (Mem.Region r : heap) {
-            String p = r.path;
-            if (!(p.contains("malloc") || p.contains("scudo") || p.contains("dalvik-alloc") || p.contains("dalvik-main"))) continue;
-            hits.addAll(Mem.scan(r.start, r.end, cp, 300));
-            scanned += r.size();
-            if (hits.size() >= 300) break;
-        }
-        if (hits.isEmpty()) {
-            for (Mem.Region r : heap) {
-                hits.addAll(Mem.scan(r.start, r.end, cp, 300));
-                scanned += r.size();
-                if (hits.size() >= 300 || scanned > (1200L << 20)) break;
-            }
-        }
-        sb.append("scanned=").append(scanned / (1024 * 1024)).append("MB hits=").append(hits.size()).append("\n");
 
+        outer:
+        for (Mem.Region r : HEAP) {
+            long p = r.start;
+            while (p + 0x200 <= r.end) {
+                int len = (int) Math.min((long) (1 << 20), r.end - p);
+                byte[] buf = Mem.read(p, len);
+                if (buf == null || buf.length < 0x200) { p += len; continue; }
+
+                int n8 = buf.length / 8;
+                long[] v = new long[n8];
+                for (int k = 0; k < n8; k++) {
+                    int o = k * 8;
+                    long x = 0;
+                    for (int j = 7; j >= 0; j--) x = (x << 8) | (buf[o + j] & 0xffL);
+                    v[k] = x;
+                    if (x == cp && hits.size() < 64) hits.add(p + o);
+                }
+                for (int k = 0; k + 48 <= n8; k++) {
+                    for (int pi = 0; pi < PAIRS8.length; pi++) {
+                        long a = v[k + PAIRS8[pi][0]];
+                        long b = v[k + PAIRS8[pi][1]];
+                        if (a == 0 || b <= a) continue;
+                        long d = b - a;
+                        if ((d & 31) != 0 || d > 1280) continue;
+                        if (!isHeap(a) || !isHeap(b)) continue;
+                        sigs.add(new long[]{p + k * 8L, PAIRS8[pi][0] * 8L, d / 32});
+                        if (sigs.size() >= 200) break outer;
+                    }
+                }
+                p += len;
+            }
+            scanned += r.size();
+            if (scanned > (1500L << 20)) break;
+        }
+
+        sb.append("isaHits=").append(hits.size()).append("\n");
         int shown = 0;
         for (long node : hits) {
             long tl = Mem.readLong(node + OFF_TL_IN_NODE);
-            if (tl == 0) continue;
-            long a = Mem.readLong(tl + OFF_PUCKS_A);
-            long b2 = Mem.readLong(tl + OFF_PUCKS_B);
-            long n = -1;
-            if (a != 0 && b2 > a && (b2 - a) % 32 == 0 && (b2 - a) / 32 <= 60) n = (b2 - a) / 32;
-            else if (b2 > 0 && b2 <= 60) n = b2;
-            if (n <= 0) continue;
-            sb.append("#").append(shown).append(" node=0x").append(Long.toHexString(node))
-              .append(" tl=0x").append(Long.toHexString(tl)).append(" n=").append(n).append("\n");
-            byte[] rec = Mem.read(a, (int) Math.min(96, n * 32));
-            if (rec != null) sb.append("  rec=").append(hex(rec)).append("\n");
+            sb.append("n=0x").append(hx(node)).append(" t3f0=0x").append(hx(tl)).append("\n");
+            if (tl != 0 && isHeap(tl) && shown < 2) {
+                byte[] z = Mem.read(tl + 0x140, 64);
+                if (z != null) sb.append("  ").append(hx(z)).append("\n");
+            }
             shown++;
             if (shown >= 5) break;
         }
-        if (shown == 0) sb.append("no valid TableNode instance\n");
+
+        sb.append("sig=").append(sigs.size()).append("\n");
+        int s2 = 0;
+        for (long[] s : sigs) {
+            long tl = s[0];
+            byte[] rec1 = Mem.read(tl + s[1], 32);
+            sb.append("s=0x").append(hx(tl)).append(" off=0x").append(hx(s[1]))
+              .append(" n=").append(s[2]).append("\n");
+            if (rec1 != null && s2 < 2) {
+                sb.append("  r=").append(hx(rec1)).append("\n");
+                long e = ld(rec1, 0);
+                if (isHeap(e)) {
+                    byte[] eb = Mem.read(e, 48);
+                    if (eb != null) sb.append("  e=0x").append(hx(e)).append(" ").append(hx(eb)).append("\n");
+                }
+            }
+            s2++;
+            if (s2 >= 4) break;
+        }
         return sb.toString();
     }
 
-    private static String hex(byte[] b) {
-        StringBuilder s = new StringBuilder(b.length * 2);
-        for (byte x : b) {
-            int v = x & 0xff;
-            s.append(Character.forDigit(v >> 4, 16)).append(Character.forDigit(v & 15, 16));
+    private static boolean isHeap(long v) {
+        for (Mem.Region r : HEAP) if (v >= r.start && v < r.end) return true;
+        return false;
+    }
+
+    private static long ld(byte[] b, int o) {
+        long v = 0;
+        for (int k = 7; k >= 0; k--) v = (v << 8) | (b[o + k] & 0xffL);
+        return v;
+    }
+
+    private static String hx(long v) { return Long.toHexString(v); }
+
+    private static String hx(byte[] b) { return b == null ? "null" : hx(b, 0, b.length); }
+
+    private static String hx(byte[] b, int off, int len) {
+        if (b == null) return "null";
+        StringBuilder s = new StringBuilder();
+        int e = Math.min(b.length, off + len);
+        for (int i = off; i < e; i++) {
+            int x = b[i] & 0xff;
+            s.append(Character.forDigit(x >> 4, 16)).append(Character.forDigit(x & 15, 16));
         }
         return s.toString();
     }
@@ -192,10 +231,10 @@ public class GameHook extends AppLifecycleCallback {
             WindowManager wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
             TextView tv = new TextView(ctx);
             tv.setText(text);
-            tv.setTextSize(7f);
+            tv.setTextSize(6.5f);
             tv.setTextColor(Color.WHITE);
             tv.setBackgroundColor(0xcc000000);
-            tv.setPadding(12, 12, 12, 12);
+            tv.setPadding(10, 10, 10, 10);
             int type = Build.VERSION.SDK_INT >= 26
                     ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
                     : WindowManager.LayoutParams.TYPE_PHONE;
