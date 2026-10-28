@@ -47,12 +47,12 @@ public class GameHook extends AppLifecycleCallback {
         new Thread(() -> {
             final Handler h = new Handler(Looper.getMainLooper());
             h.post(() -> box = addBox(app, "starting..."));
-            for (int i = 0; i < 24; i++) {
+            for (int i = 0; i < 40; i++) {
                 try { Thread.sleep(5000); } catch (InterruptedException ignored) { }
                 if (i == 0) continue;
                 String rep = work(i * 5);
                 h.post(() -> { if (box != null) box.setText(rep); });
-                if (i % 4 == 0) write(app, "v15_report.txt", rep);
+                if (i % 2 == 0) write(app, "v17_report.txt", rep);
             }
         }).start();
     }
@@ -62,7 +62,8 @@ public class GameHook extends AppLifecycleCallback {
 
     private String work(int t) {
         StringBuilder sb = new StringBuilder();
-        sb.append("Predictor v15 t=").append(t).append("s pid=").append(android.os.Process.myPid()).append("\n");
+        sb.append("Predictor v17 t=").append(t).append("s pid=")
+          .append(android.os.Process.myPid()).append("\n");
         if (!Mem.open()) { sb.append("MEM FAIL\n"); return sb.toString(); }
 
         List<Mem.Region> regs = Mem.regions();
@@ -103,76 +104,75 @@ public class GameHook extends AppLifecycleCallback {
         long cp = base + OFF_CLASSREC - bias;
         sb.append("BASE=0x").append(hx(base)).append(" malloc=").append(MALLOC.size()).append("\n");
 
-        List<Long> nodes = new ArrayList<>();
-        for (Mem.Region r : MALLOC) { scanIsa(r, cp, nodes); if (nodes.size() >= 20) break; }
-        sb.append("nodes=").append(nodes.size()).append("\n");
+        List<Long> exact = new ArrayList<>();
+        List<Long> near = new ArrayList<>();
+        for (Mem.Region r : MALLOC) { scanIsa(r, cp, exact, near); if (exact.size() >= 40) break; }
+        sb.append("isaExact=").append(exact.size()).append(" isaNear=").append(near.size()).append("\n");
 
-        long bestTl = 0, bestArr = 0, bestOff = 0, bestN = 0;
+        List<Long> all = new ArrayList<>();
+        all.addAll(exact);
+        all.addAll(near);
 
-        int ni = 0;
-        for (long node : nodes) {
+        int live = 0, dumped = 0;
+        for (long node : all) {
             long tl = Mem.readLong(node + OFF_TL);
-            sb.append("N").append(ni).append(" node=0x").append(hx(node)).append(" tl=0x").append(hx(tl)).append("\n");
-            if (!isHeap(tl)) { if (++ni >= 2) break; continue; }
+            if (!isHeap(tl)) continue;
 
-            long vt = Mem.readLong(tl);
-            sb.append(" vt=0x").append(hx(vt)).append(" ").append(tagOf(vt)).append("\n");
+            long b0 = Mem.readLong(tl + 0x168);
+            long e0 = Mem.readLong(tl + 0x170);
+            long cnt = -1;
+            if (b0 != 0 && e0 >= b0 && (e0 - b0) % 8 == 0 && (e0 - b0) / 8 <= 40) cnt = (e0 - b0) / 8;
 
-            int cnt = 0;
-            for (long off = 0; off < 0x400; off += 8) {
-                long tt = Mem.readLong(tl + off);
-                if (!isHeap(tt)) continue;
-                long av = Mem.readLong(tt);
-                String fl = (isLib(av) ? " V" : "") + arrFlag(tt);
-                sb.append("  +").append(hx(off)).append(" -> 0x").append(hx(tt))
-                  .append(" ").append(tagOf(tt)).append(fl).append("\n");
-                long n = arrCount(tt);
-                if (n > bestN) { bestN = n; bestTl = tl; bestArr = tt; bestOff = off; }
-                if (++cnt >= 14) break;
+            sb.append("N=0x").append(hx(node)).append(" tl=0x").append(hx(tl))
+              .append(" vec=").append(cnt).append("\n");
+
+            if (dumped < 2) {
+                byte[] lo = Mem.read(tl, 0x50);
+                if (lo != null) {
+                    sb.append(" lo=").append(hx(lo)).append("\n");
+                    sb.append(" ld");
+                    for (int k = 0; k < 10; k++) sb.append(" ").append(dm(ld(lo, k * 8)));
+                    sb.append("\n");
+                }
+                dumped++;
             }
-            if (++ni >= 2) break;
-        }
 
-        if (bestN > 0) {
-            sb.append("best tl=0x").append(hx(bestTl)).append(" +").append(hx(bestOff))
-              .append(" arr=0x").append(hx(bestArr)).append(" n=").append(bestN).append("\n");
-            long a = Mem.readLong(bestArr);
-            for (int i = 0; i < Math.min(bestN, 3); i++) {
-                long pv = Mem.readLong(a + i * 8L);
-                sb.append("  e").append(i).append("=0x").append(hx(pv)).append(" ").append(tagOf(pv)).append("\n");
-                if (isHeap(pv)) {
-                    byte[] pb = Mem.read(pv, 64);
-                    if (pb != null) {
-                        sb.append("   ").append(hx(pb)).append("\n");
-                        sb.append("   f");
-                        for (int k = 0; k < 8; k++) sb.append(" ").append(Float.intBitsToFloat((int) ld(pb, k * 4)));
-                        sb.append("\n");
+            if (cnt > 0) {
+                live++;
+                byte[] hi = Mem.read(tl + 0x100, 0xA0);
+                if (hi != null) {
+                    sb.append("  H").append(hx(hi)).append("\n");
+                    sb.append("  D");
+                    for (int k = 0; k < 20; k++) sb.append(" ").append(dm(ld(hi, k * 8)));
+                    sb.append("\n");
+                }
+                for (int i = 0; i < Math.min(cnt, 3); i++) {
+                    long pv = Mem.readLong(b0 + i * 8L);
+                    sb.append("  p").append(i).append("=0x").append(hx(pv)).append("\n");
+                    if (isHeap(pv)) {
+                        byte[] pb = Mem.read(pv, 0x90);
+                        if (pb != null) {
+                            sb.append("   D");
+                            for (int k = 0; k < 18; k++) sb.append(" ").append(dm(ld(pb, k * 8)));
+                            sb.append("\n");
+                        }
                     }
                 }
             }
+            if (live >= 2) break;
         }
+        if (live == 0) sb.append("no non-empty vec\n");
+
+        List<String> vs = new ArrayList<>();
+        for (Mem.Region r : MALLOC) { scanVec(r, vs, 10); if (vs.size() >= 10) break; }
+        sb.append("vecs=").append(vs.size()).append("\n");
+        int q = 0;
+        for (String s : vs) { sb.append(s).append("\n"); if (++q >= 5) break; }
+
         return sb.toString();
     }
 
-    private static long arrCount(long t) {
-        for (int k = 0; k < 3; k++) {
-            long a = Mem.readLong(t + k * 8L);
-            long b = Mem.readLong(t + k * 8L + 8);
-            if (a == 0 || b <= a) continue;
-            long d = b - a;
-            if (d % 8 != 0 || d / 8 < 2 || d / 8 > 40) continue;
-            if (!isHeap(a) || !isHeap(b)) continue;
-            return d / 8;
-        }
-        return 0;
-    }
-
-    private static String arrFlag(long t) {
-        long n = arrCount(t);
-        return n > 0 ? (" n=" + n) : "";
-    }
-
-    private void scanIsa(Mem.Region r, long cp, List<Long> out) {
+    private void scanIsa(Mem.Region r, long cp, List<Long> exact, List<Long> near) {
         long p = r.start;
         while (p + 8 <= r.end) {
             int len = (int) Math.min((long) (1 << 20), r.end - p);
@@ -180,13 +180,61 @@ public class GameHook extends AppLifecycleCallback {
             if (buf == null || buf.length < 8) { p += len; continue; }
             int n8 = buf.length / 8;
             for (int k = 0; k < n8; k++) {
-                int o = k * 8;
-                long x = 0;
-                for (int j = 7; j >= 0; j--) x = (x << 8) | (buf[o + j] & 0xffL);
-                if (x == cp || x == cp - OFF_META) { if (out.size() < 20) out.add(p + o); }
+                long x = ld(buf, k * 8);
+                if (x == cp) { if (exact.size() < 40) exact.add(p + k * 8L); }
+                else if (x == cp - OFF_META) { if (near.size() < 40) near.add(p + k * 8L); }
             }
             p += len;
         }
+    }
+
+    private void scanVec(Mem.Region r, List<String> out, int cap) {
+        long p = r.start;
+        while (p + 0x200 <= r.end) {
+            int len = (int) Math.min((long) (1 << 20), r.end - p);
+            byte[] buf = Mem.read(p, len);
+            if (buf == null || buf.length < 0x200) { p += len; continue; }
+            int n8 = buf.length / 8;
+            for (int k = 0; k + 2 < n8; k++) {
+                long a = ld(buf, k * 8);
+                long b = ld(buf, k * 8 + 8);
+                if (a == 0 || b <= a) continue;
+                long d = b - a;
+                if ((d & 7) != 0) continue;
+                long n = d / 8;
+                if (n < 5 || n > 40) continue;
+                if (!isHeap(a) || !isHeap(b)) continue;
+
+                int good = 0;
+                long first = 0;
+                for (int i = 0; i < Math.min(n, 4); i++) {
+                    long pv = Mem.readLong(a + i * 8L);
+                    if (!isHeap(pv)) break;
+                    double x = Double.longBitsToDouble(Mem.readLong(pv + 0x10));
+                    double y = Double.longBitsToDouble(Mem.readLong(pv + 0x18));
+                    if (plaus(x) && plaus(y)) { good++; if (first == 0) first = pv; }
+                }
+                if (good >= 2 && first != 0) {
+                    StringBuilder s = new StringBuilder();
+                    s.append("V=0x").append(hx(p + k * 8L)).append(" n=").append(n)
+                     .append(" rec=0x").append(hx(first)).append("\n");
+                    byte[] rb = Mem.read(first, 0x90);
+                    if (rb != null) {
+                        s.append("  D");
+                        for (int j = 0; j < 18; j++) s.append(" ").append(dm(ld(rb, j * 8)));
+                    }
+                    out.add(s.toString());
+                    if (out.size() >= cap) return;
+                }
+            }
+            p += len;
+        }
+    }
+
+    private static boolean plaus(double d) {
+        if (Double.isNaN(d) || Double.isInfinite(d)) return false;
+        double a = Math.abs(d);
+        return a > 1e-6 && a < 5000.0;
     }
 
     private static int regionOf(long v) {
@@ -201,38 +249,29 @@ public class GameHook extends AppLifecycleCallback {
 
     private static boolean isHeap(long v) { return regionOf(v) >= 0; }
 
-    private static boolean isLib(long v) {
-        int i = regionOf(v);
-        return i >= 0 && HEAP.get(i).path.endsWith(".apk");
-    }
-
-    private static String tagOf(long v) {
-        int i = regionOf(v);
-        if (i < 0) return "-";
-        String p = HEAP.get(i).path;
-        if (p.isEmpty()) return "anon";
-        if (p.contains("malloc") || p.contains("scudo")) return "MALLOC";
-        if (p.endsWith(".apk")) return "LIB";
-        return p.length() > 18 ? p.substring(p.length() - 18) : p;
-    }
-
     private static long ld(byte[] b, int o) {
         long v = 0;
         for (int k = 7; k >= 0; k--) v = (v << 8) | (b[o + k] & 0xffL);
         return v;
     }
 
+    private static String dm(double d) {
+        if (Double.isNaN(d)) return "nan";
+        if (Double.isInfinite(d)) return d > 0 ? "inf" : "-inf";
+        double a = Math.abs(d);
+        if (a == 0) return "0";
+        if (a >= 1e-4 && a < 1e7) return String.format("%.3f", d);
+        return "~" + Long.toHexString(Double.doubleToLongBits(d));
+    }
+
     private static String hx(long v) { return Long.toHexString(v); }
 
-    private static String hx(byte[] b) { return b == null ? "null" : hx(b, 0, b.length); }
-
-    private static String hx(byte[] b, int off, int len) {
+    private static String hx(byte[] b) {
         if (b == null) return "null";
         StringBuilder s = new StringBuilder();
-        int e = Math.min(b.length, off + len);
-        for (int i = off; i < e; i++) {
-            int x = b[i] & 0xff;
-            s.append(Character.forDigit(x >> 4, 16)).append(Character.forDigit(x & 15, 16));
+        for (byte x : b) {
+            int v = x & 0xff;
+            s.append(Character.forDigit(v >> 4, 16)).append(Character.forDigit(v & 15, 16));
         }
         return s.toString();
     }
@@ -264,10 +303,10 @@ public class GameHook extends AppLifecycleCallback {
             WindowManager wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
             TextView tv = new TextView(ctx);
             tv.setText(text);
-            tv.setTextSize(5.5f);
+            tv.setTextSize(6f);
             tv.setTextColor(Color.WHITE);
             tv.setBackgroundColor(0xcc000000);
-            tv.setPadding(8, 8, 8, 8);
+            tv.setPadding(10, 10, 10, 10);
             int type = Build.VERSION.SDK_INT >= 26
                     ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
                     : WindowManager.LayoutParams.TYPE_PHONE;
