@@ -28,6 +28,8 @@ public class GameHook extends AppLifecycleCallback {
     private static volatile TextView box;
     private static volatile boolean started = false;
     private static List<long[]> RW = new ArrayList<>();
+    private static List<long[]> LIBR = new ArrayList<>();
+    private static List<long[]> LIBRW = new ArrayList<>();
 
     @Override
     public void afterApplicationOnCreate(String packageName, String processName,
@@ -41,123 +43,134 @@ public class GameHook extends AppLifecycleCallback {
             final Handler h = new Handler(Looper.getMainLooper());
             h.post(() -> box = addBox(app, "starting..."));
             for (int t = 0; t < 600; t++) {
-                long base = findBase();
-                if (base < 0) { set(h, "v15 t=" + t + " no base"); sleep(1000); continue; }
-                loadRW();
-                List<Long> hits = scan(base + VTABLE_OFF);
-
-                StringBuilder sb = new StringBuilder();
-                sb.append("v15 t=").append(t).append(" hits=").append(hits.size()).append("\n");
-
-                long bh = 0, bo = 0, bt = 0, bn = 0, bs = 0;
-
-                try (RandomAccessFile mem = new RandomAccessFile("/proc/self/mem", "r")) {
-                    for (Long a : hits) {
-                        long[] best = bestArr(mem, a);
-                        sb.append("h=0x").append(hx(a)).append(" off=0x").append(hx(best[0]))
-                          .append(" n=").append(best[2]).append(" sc=").append(best[3]).append("\n");
-                        if (best[3] > bs || (best[3] == bs && best[2] > bn)) {
-                            bs = best[3]; bn = best[2]; bo = best[0]; bt = best[1]; bh = a;
-                        }
-                    }
-
-                    if (bh != 0) {
-                        sb.append("BEST h=0x").append(hx(bh)).append(" +0x").append(hx(bo))
-                          .append(" arr=0x").append(hx(bt)).append(" n=").append(bn)
-                          .append(" sc=").append(bs).append("\n");
-                        byte[] hd = new byte[0x40];
-                        try { mem.seek(bh); mem.readFully(hd); } catch (Throwable e) { hd = null; }
-                        if (hd != null) {
-                            sb.append(" H");
-                            for (int j = 0; j < 8; j++) sb.append(" ").append(dm(Double.longBitsToDouble(ld(hd, j * 8))));
-                            sb.append("\n");
-                        }
-                        long a = readLong(mem, bt);
-                        for (int i = 0; i < Math.min(bn, 8); i++) {
-                            long pv = readLong(mem, a + i * 8L);
-                            sb.append(" e").append(i).append("=0x").append(hx(pv)).append(" ").append(tag(pv)).append("\n");
-                            if (!isHeap(pv)) continue;
-                            byte[] b = new byte[0x40];
-                            try { mem.seek(pv); mem.readFully(b); } catch (Throwable e) { continue; }
-                            sb.append("  ").append(hx(b)).append("\n");
-                            sb.append("  d");
-                            for (int j = 0; j < 8; j++) sb.append(" ").append(dm(Double.longBitsToDouble(ld(b, j * 8))));
-                            sb.append("\n");
-                        }
-                    }
-                } catch (Throwable e) {
-                    sb.append("mem ").append(e).append("\n");
-                }
-                set(h, sb.toString());
-                sleep(1000);
+                String s = work(t);
+                set(h, s);
+                sleep(1500);
             }
         }).start();
     }
 
-    private long[] bestArr(RandomAccessFile mem, long h) {
-        long bo = 0, bt = 0, bn = 0, bs = 0;
-        for (long off = 0; off < 0x5B0; off += 8) {
-            long v = readLong(mem, h + off);
-            if (!isHeap(v)) continue;
-            for (int k = 0; k < 3; k++) {
-                long a = readLong(mem, v + k * 8L);
-                long b = readLong(mem, v + k * 8L + 8);
-                if (a < 0x1000L || b <= a) continue;
-                long d = b - a;
-                if (d % 8 != 0) continue;
-                long n = d / 8;
-                if (n < 2 || n > 40) continue;
-                if (!isHeap(a) || !isHeap(b)) continue;
-                long sc = score(mem, a, n);
-                if (sc > bs || (sc == bs && n > bn)) { bs = sc; bn = n; bt = v; bo = off; }
+    private String work(int t) {
+        StringBuilder sb = new StringBuilder();
+        long base = findBase();
+        if (base < 0) return "v16 t=" + t + " no base\n";
+        loadRegions();
+
+        sb.append("v16 t=").append(t).append(" base=0x").append(hx(base)).append("\n");
+        sb.append("oldOff=0x").append(hx(base + VTABLE_OFF)).append("\n");
+
+        List<long[]> found = new ArrayList<>();
+        int total = 0;
+
+        try (RandomAccessFile mem = new RandomAccessFile("/proc/self/mem", "r")) {
+            for (long[] r : LIBRW) {
+                long a = r[0];
+                byte[] buf = new byte[1 << 18];
+                while (a < r[1]) {
+                    int want = (int) Math.min(buf.length, r[1] - a);
+                    int got;
+                    try { mem.seek(a); got = mem.read(buf, 0, want); }
+                    catch (Throwable x) { a += want; continue; }
+                    if (got <= 0) { a += want; continue; }
+                    for (int i = 0; i + 8 <= got; i += 8) {
+                        long v = 0;
+                        for (int b = 7; b >= 0; b--) v = (v << 8) | (buf[i + b] & 0xFFL);
+                        if (!inLib(v)) continue;
+                        String nm = ident(mem, v);
+                        if (nm == null) continue;
+                        total++;
+                        if (nm.matches("(?i).*(puck|coin|disc|striker|table).*") && found.size() < 30) {
+                            found.add(new long[]{v, a + i});
+                        }
+                    }
+                    a += got;
+                }
             }
+
+            sb.append("names=").append(total).append(" m=").append(found.size()).append("\n");
+
+            long tn = 0;
+            for (long[] f : found) {
+                String nm = ident(mem, f[0]);
+                long rec = f[1] - 0x10;
+                sb.append("M ").append(nm).append(" rec=0x").append(hx(rec)).append("\n");
+                if ("TableNode".equals(nm)) tn = rec;
+            }
+            sb.append("TableNode ").append(tn == 0 ? "absent"
+                    : (tn == base + VTABLE_OFF ? "MATCH" : "DIFF 0x" + hx(tn))).append("\n");
+
+            long pk = 0;
+            for (long[] f : found) {
+                String nm = ident(mem, f[0]);
+                if (nm != null && nm.matches("(?i).*(puck|coin|disc).*")) { pk = f[1] - 0x10; break; }
+            }
+            if (pk == 0) { sb.append("no puck class\n"); return sb.toString(); }
+
+            sb.append("pk=0x").append(hx(pk)).append("\n");
+            List<Long> hits = scan(pk);
+            sb.append("pkHits=").append(hits.size()).append("\n");
+            if (!hits.isEmpty()) {
+                long o = hits.get(0);
+                for (long off = 0; off < 0x100; off += 0x20) {
+                    byte[] b = new byte[0x20];
+                    try { mem.seek(o + off); mem.readFully(b); } catch (Throwable e) { break; }
+                    sb.append("+").append(hx(off)).append(" ").append(hx(b)).append("\n");
+                    sb.append("  d");
+                    for (int j = 0; j < 4; j++) sb.append(" ").append(dm(Double.longBitsToDouble(ld(b, j * 8))));
+                    sb.append("\n");
+                }
+            }
+        } catch (Throwable e) {
+            sb.append("err ").append(e).append("\n");
         }
-        return new long[]{bo, bt, bn, bs};
+        return sb.toString();
     }
 
-    private long score(RandomAccessFile mem, long a, long n) {
-        long s = 0;
-        for (int i = 0; i < Math.min(n, 20); i++) {
-            long o = readLong(mem, a + i * 8L);
-            if (!isHeap(o)) continue;
-            double dx = Double.longBitsToDouble(readLong(mem, o + 0x10));
-            double dy = Double.longBitsToDouble(readLong(mem, o + 0x18));
-            if (ok(dx) && ok(dy)) { s += 2; continue; }
-            long v = readLong(mem, o + 0x10);
-            float fx = Float.intBitsToFloat((int) v);
-            float fy = Float.intBitsToFloat((int) (v >>> 32));
-            if (ok(fx) && ok(fy)) s++;
+    private String ident(RandomAccessFile mem, long a) {
+        byte[] b = new byte[48];
+        try { mem.seek(a); mem.readFully(b); } catch (Throwable t) { return null; }
+        int n = 0;
+        while (n < b.length && b[n] != 0) n++;
+        if (n < 3 || n > 40) return null;
+        char c0 = (char) (b[0] & 0xFF);
+        if (!(Character.isLetter(c0) || c0 == '_')) return null;
+        for (int i = 0; i < n; i++) {
+            char c = (char) (b[i] & 0xFF);
+            if (!(Character.isLetterOrDigit(c) || c == '_')) return null;
         }
-        return s;
+        return new String(b, 0, n);
     }
 
-    private static boolean ok(double d) {
-        return d > -6000 && d < 6000 && (d > 0.5 || d < -0.5);
-    }
-
-    private static String dm(double d) {
-        if (Double.isNaN(d)) return "nan";
-        if (Double.isInfinite(d)) return "inf";
-        if (d > -0.005 && d < 0.005) return "0";
-        if (d > -1e7 && d < 1e7) return String.format("%.2f", d);
-        return "big";
-    }
-
-    private void loadRW() {
+    private void loadRegions() {
         RW = new ArrayList<>();
+        LIBR = new ArrayList<>();
+        LIBRW = new ArrayList<>();
         try (BufferedReader r = new BufferedReader(new FileReader("/proc/self/maps"))) {
             String line;
             while ((line = r.readLine()) != null) {
                 String[] p = line.split("\\s+");
-                if (p.length < 2 || !p[1].startsWith("rw")) continue;
+                if (p.length < 2) continue;
                 int d = p[0].indexOf('-');
                 if (d < 0) continue;
+                long s, e;
                 try {
-                    RW.add(new long[]{Long.parseLong(p[0].substring(0, d), 16),
-                            Long.parseLong(p[0].substring(d + 1), 16)});
-                } catch (Throwable x) { }
+                    s = Long.parseLong(p[0].substring(0, d), 16);
+                    e = Long.parseLong(p[0].substring(d + 1), 16);
+                } catch (Throwable x) { continue; }
+                String path = p.length >= 6 ? p[5] : "";
+                if (path.contains(LIB)) {
+                    LIBR.add(new long[]{s, e});
+                    if (p[1].startsWith("rw")) LIBRW.add(new long[]{s, e});
+                }
+                if (p[1].startsWith("rw")) RW.add(new long[]{s, e});
             }
         } catch (Throwable t) { }
+    }
+
+    private boolean inLib(long v) {
+        if (v < 0x1000L) return false;
+        for (long[] r : LIBR) if (v >= r[0] && v < r[1]) return true;
+        return false;
     }
 
     private long findBase() {
@@ -200,29 +213,18 @@ public class GameHook extends AppLifecycleCallback {
                     a += got;
                 }
             } catch (Throwable t) { }
-            if (hits.size() > 300) break;
+            if (hits.size() > 200) break;
         }
         return hits;
     }
 
-    private long readLong(RandomAccessFile mem, long a) {
-        try {
-            byte[] b = new byte[8];
-            mem.seek(a);
-            mem.readFully(b);
-            long v = 0;
-            for (int i = 7; i >= 0; i--) v = (v << 8) | (b[i] & 0xFFL);
-            return v;
-        } catch (Throwable t) { return -1; }
+    private static String dm(double d) {
+        if (Double.isNaN(d)) return "nan";
+        if (Double.isInfinite(d)) return "inf";
+        if (d > -0.005 && d < 0.005) return "0";
+        if (d > -1e7 && d < 1e7) return String.format("%.2f", d);
+        return "big";
     }
-
-    private boolean isHeap(long v) {
-        if (v < 0x1000L) return false;
-        for (long[] r : RW) if (v >= r[0] && v < r[1]) return true;
-        return false;
-    }
-
-    private String tag(long v) { return isHeap(v) ? "HEAP" : "-"; }
 
     private static long ld(byte[] b, int o) {
         long v = 0;
@@ -251,7 +253,7 @@ public class GameHook extends AppLifecycleCallback {
             tv.setText(text);
             tv.setTextSize(6f);
             tv.setTextColor(Color.WHITE);
-            tv.setBackgroundColor(0xaa000000);
+            tv.setBackgroundColor(0xcc000000);
             tv.setPadding(8, 8, 8, 8);
             int type = Build.VERSION.SDK_INT >= 26
                     ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
