@@ -24,7 +24,7 @@ public class GameHook extends AppLifecycleCallback {
 
     private static final String TAG = "PredictorHook";
     private static final String GAME = "com.miniclip.carrom";
-    private static final String APK = "split_config.arm64_v8a.apk";
+    private static final String LIB = "libgame";
 
     private static final long VTABLE_OFF = 0x0296f2a0L;
     private static final long TABLELOGIC_OFF = 0x3F0L;
@@ -46,16 +46,17 @@ public class GameHook extends AppLifecycleCallback {
             set(h, "waiting for engine...");
 
             long base = -1;
-            int apkLines = 0;
+            long lines = 0;
+            String sample = "";
             for (int i = 0; i < 240; i++) {
                 long[] r = findBase();
-                apkLines = (int) r[1];
-                if (r[0] >= 0) { base = r[0]; break; }
-                set(h, "waiting for engine...\napkLines=" + apkLines + " t=" + i);
+                lines = r[1];
+                if (r[0] >= 0) { base = r[0]; sample = readLineAt(base); break; }
+                set(h, "waiting for engine...\nlibLines=" + lines + " t=" + i);
                 sleep(500);
             }
             if (base < 0) {
-                set(h, "NO BASE\napkLines=" + apkLines + "\nmaps has no " + APK);
+                set(h, "NO BASE\nlibLines=" + lines + "\nno 'libgame' in maps");
                 return;
             }
             long vt = base + VTABLE_OFF;
@@ -64,7 +65,7 @@ public class GameHook extends AppLifecycleCallback {
 
             List<Long> hits = scan(vt);
             StringBuilder sb = new StringBuilder();
-            sb.append("v9 base=0x").append(Long.toHexString(base)).append("\n");
+            sb.append("v10 base=0x").append(Long.toHexString(base)).append("\n");
             sb.append("vtable=0x").append(Long.toHexString(vt)).append("\n");
             sb.append("hits=").append(hits.size()).append("\n");
             try (RandomAccessFile mem = new RandomAccessFile("/proc/self/mem", "r")) {
@@ -91,13 +92,24 @@ public class GameHook extends AppLifecycleCallback {
         try { Thread.sleep(ms); } catch (InterruptedException ignored) { }
     }
 
+    private String readLineAt(long base) {
+        try (BufferedReader r = new BufferedReader(new FileReader("/proc/self/maps"))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (line.contains(LIB) && line.contains(Long.toHexString(base))) return line.trim();
+            }
+        } catch (Throwable t) { }
+        return "";
+    }
+
     private long[] findBase() {
-        long best = -1;
+        long bestStart = -1;
+        long bestOff = -1;
         long lines = 0;
         try (BufferedReader r = new BufferedReader(new FileReader("/proc/self/maps"))) {
             String line;
             while ((line = r.readLine()) != null) {
-                if (!line.contains(APK)) continue;
+                if (!line.contains(LIB)) continue;
                 lines++;
                 String[] p = line.split("\\s+");
                 if (p.length < 3) continue;
@@ -105,11 +117,10 @@ public class GameHook extends AppLifecycleCallback {
                 if (dash < 0) continue;
                 long start = Long.parseLong(p[0].substring(0, dash), 16);
                 long off = Long.parseLong(p[2], 16);
-                long b = start - off;
-                if (best < 0 || b < best) best = b;
+                if (bestOff < 0 || off < bestOff) { bestOff = off; bestStart = start; }
             }
         } catch (Throwable t) { }
-        return new long[]{best, lines};
+        return new long[]{bestStart, lines};
     }
 
     private List<Long> scan(long vt) {
