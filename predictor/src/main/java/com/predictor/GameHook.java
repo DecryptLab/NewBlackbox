@@ -7,7 +7,6 @@ import android.graphics.PixelFormat;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
-import android.util.Log;
 import android.view.Gravity;
 import android.view.WindowManager;
 import android.widget.TextView;
@@ -22,14 +21,15 @@ import top.niunaijun.blackbox.app.configuration.AppLifecycleCallback;
 
 public class GameHook extends AppLifecycleCallback {
 
-    private static final String TAG = "PredictorHook";
     private static final String GAME = "com.miniclip.carrom";
     private static final String LIB = "libgame";
     private static final long VTABLE_OFF = 0x0296f2a0L;
-    private static final long TABLELOGIC_OFF = 0x3F0L;
 
     private static volatile TextView box;
     private static volatile boolean started = false;
+    private static List<long[]> RW = new ArrayList<>();
+    private static List<long[]> LIBR = new ArrayList<>();
+    private static List<String> LIBP = new ArrayList<>();
 
     @Override
     public void afterApplicationOnCreate(String packageName, String processName,
@@ -43,29 +43,42 @@ public class GameHook extends AppLifecycleCallback {
             final Handler h = new Handler(Looper.getMainLooper());
             h.post(() -> box = addBox(app, "starting..."));
             for (int t = 0; t < 600; t++) {
-                long[] r = findBase();
-                if (r[0] < 0) { set(h, "v12 t=" + t + " no base"); sleep(1000); continue; }
-                List<Long> hits = scan(r[0] + VTABLE_OFF);
+                long base = findBase();
+                if (base < 0) { set(h, "v14 t=" + t + " no base"); sleep(1000); continue; }
+                loadRegions();
+                List<Long> hits = scan(base + VTABLE_OFF);
 
                 StringBuilder sb = new StringBuilder();
-                sb.append("v12 t=").append(t).append(" hits=").append(hits.size()).append("\n");
-                int shown = 0;
+                sb.append("v14 t=").append(t).append(" base=0x").append(hx(base))
+                  .append(" vt=0x").append(hx(base + VTABLE_OFF))
+                  .append(" hits=").append(hits.size()).append("\n");
+
                 try (RandomAccessFile mem = new RandomAccessFile("/proc/self/mem", "r")) {
+                    int hi = 0;
                     for (Long a : hits) {
-                        long tl = readLong(mem, a + TABLELOGIC_OFF);
-                        if (tl < 0x1000L || tl > 0x8000000000L) continue;
-                        sb.append("tl=0x").append(Long.toHexString(tl)).append("\n");
-
-                        for (long off = 0x130; off <= 0x1d0; off += 8) {
-                            sb.append(Long.toHexString(off)).append(":")
-                              .append(Long.toHexString(readLong(mem, tl + off))).append(" ");
+                        sb.append("h=0x").append(hx(a)).append(" tag=").append(tag(a)).append("\n");
+                        int shown = 0, dumped = 0;
+                        for (long off = 0; off < 0x5B0; off += 8) {
+                            long v = readLong(mem, a + off);
+                            if (!isHeap(v)) continue;
+                            String fl = isLib(readLong(mem, v)) ? " V" : "";
+                            fl += arrFlag(mem, v);
+                            sb.append("  +").append(hx(off)).append(" -> 0x").append(hx(v))
+                              .append(" ").append(tag(v)).append(fl).append("\n");
+                            if (dumped < 2) {
+                                byte[] b = new byte[32];
+                                try { mem.seek(v); mem.readFully(b); } catch (Throwable e) { b = null; }
+                                if (b != null) {
+                                    sb.append("    ").append(hx(b)).append("\n");
+                                    sb.append("    d");
+                                    for (int j = 0; j < 4; j++) sb.append(" ").append(dm(Double.longBitsToDouble(ld(b, j * 8))));
+                                    sb.append("\n");
+                                }
+                                dumped++;
+                            }
+                            if (++shown >= (hi == 0 ? 18 : 12)) break;
                         }
-                        sb.append("\n");
-
-                        sb.append("vec=").append(countVec(mem, tl))
-                          .append(" tree=").append(countTree(mem, tl))
-                          .append(" c2c0=").append(readLong(mem, tl + 0x2c0)).append("\n");
-                        if (++shown >= 2) break;
+                        if (++hi >= 2) break;
                     }
                 } catch (Throwable e) {
                     sb.append("mem ").append(e).append("\n");
@@ -76,59 +89,51 @@ public class GameHook extends AppLifecycleCallback {
         }).start();
     }
 
-    private int countVec(RandomAccessFile mem, long tl) {
-        long b = readLong(mem, tl + 0x168);
-        long e = readLong(mem, tl + 0x170);
-        if (b < 0x1000L || b > 0x8000000000L || e <= b || (e - b) > 0x4000L) return -1;
-        int ok = 0;
-        for (long p = b; p + 8 <= e && ok < 64; p += 8) {
-            long o = readLong(mem, p);
-            if (o < 0x1000L || o > 0x8000000000L) continue;
-            double x = readDouble(mem, o + 0x10);
-            double y = readDouble(mem, o + 0x18);
-            if (x > -20 && x < 220 && y > -20 && y < 220) ok++;
-        }
-        return ok;
+    private static String dm(double d) {
+        if (Double.isNaN(d)) return "nan";
+        if (Double.isInfinite(d)) return "inf";
+        if (d > -0.005 && d < 0.005) return "0";
+        if (d > -1e9 && d < 1e9) return String.format("%.2f", d);
+        return "big";
     }
 
-    private int countTree(RandomAccessFile mem, long tl) {
-        long end = readLong(mem, tl + 0x170);
-        long n = readLong(mem, tl + 0x168);
-        int ok = 0, g = 0;
-        while (n > 0x1000L && n < 0x8000000000L && n != end && g++ < 40) {
-            long o = readLong(mem, n + 0x30);
-            if (o > 0x1000L && o < 0x8000000000L) {
-                double x = readDouble(mem, o + 0x10);
-                double y = readDouble(mem, o + 0x18);
-                if (x > -20 && x < 220 && y > -20 && y < 220) ok++;
+    private String arrFlag(RandomAccessFile mem, long t) {
+        for (int k = 0; k < 3; k++) {
+            long a = readLong(mem, t + k * 8L);
+            long b = readLong(mem, t + k * 8L + 8);
+            if (a < 0x1000L || b <= a) continue;
+            long d = b - a;
+            if (d % 8 != 0 || d / 8 < 2 || d / 8 > 40) continue;
+            if (!isHeap(a) || !isHeap(b)) continue;
+            return " n=" + (d / 8);
+        }
+        return "";
+    }
+
+    private void loadRegions() {
+        RW = new ArrayList<>();
+        LIBR = new ArrayList<>();
+        LIBP = new ArrayList<>();
+        try (BufferedReader r = new BufferedReader(new FileReader("/proc/self/maps"))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                String[] p = line.split("\\s+");
+                if (p.length < 2) continue;
+                int d = p[0].indexOf('-');
+                if (d < 0) continue;
+                long s, e;
+                try {
+                    s = Long.parseLong(p[0].substring(0, d), 16);
+                    e = Long.parseLong(p[0].substring(d + 1), 16);
+                } catch (Throwable x) { continue; }
+                String path = p.length >= 6 ? p[5] : "";
+                if (path.contains(LIB)) { LIBR.add(new long[]{s, e}); LIBP.add(path); }
+                if (p[1].startsWith("rw")) RW.add(new long[]{s, e});
             }
-            n = next(mem, n);
-        }
-        return ok;
+        } catch (Throwable t) { }
     }
 
-    private long next(RandomAccessFile mem, long node) {
-        long right = readLong(mem, node + 0x8);
-        if (right > 0x1000L && right < 0x8000000000L) {
-            long n = right, l = readLong(mem, n);
-            int g = 0;
-            while (l > 0x1000L && l < 0x8000000000L && g++ < 40) { n = l; l = readLong(mem, n); }
-            return n;
-        }
-        long p = readLong(mem, node + 0x10);
-        int g = 0;
-        while (p > 0x1000L && p < 0x8000000000L && g++ < 40) {
-            if (readLong(mem, p + 0x8) != node) break;
-            node = p;
-            p = readLong(mem, p + 0x10);
-        }
-        return p;
-    }
-
-    private void set(Handler h, String s) { h.post(() -> { if (box != null) box.setText(s); }); }
-    private void sleep(int ms) { try { Thread.sleep(ms); } catch (InterruptedException ignored) { } }
-
-    private long[] findBase() {
+    private long findBase() {
         long bs = -1, bo = -1;
         try (BufferedReader r = new BufferedReader(new FileReader("/proc/self/maps"))) {
             String line;
@@ -143,27 +148,17 @@ public class GameHook extends AppLifecycleCallback {
                 if (bo < 0 || o < bo) { bo = o; bs = s; }
             }
         } catch (Throwable t) { }
-        return new long[]{bs};
+        return bs;
     }
 
     private List<Long> scan(long vt) {
         List<Long> hits = new ArrayList<>();
-        try (BufferedReader r = new BufferedReader(new FileReader("/proc/self/maps"))) {
-            String line;
-            while ((line = r.readLine()) != null) {
-                if (!line.contains("rw-p")) continue;
-                String[] p = line.split("\\s+");
-                if (p.length < 3) continue;
-                int d = p[0].indexOf('-');
-                if (d < 0) continue;
-                long s = Long.parseLong(p[0].substring(0, d), 16);
-                long e = Long.parseLong(p[0].substring(d + 1), 16);
-                long len = e - s;
-                if (len <= 0 || len > (32L << 20)) continue;
-                scanRange(s, e, vt, hits);
-                if (hits.size() > 300) break;
-            }
-        } catch (Throwable t) { }
+        for (long[] r : RW) {
+            long len = r[1] - r[0];
+            if (len <= 0 || len > (32L << 20)) continue;
+            scanRange(r[0], r[1], vt, hits);
+            if (hits.size() > 300) break;
+        }
         return hits;
     }
 
@@ -198,20 +193,54 @@ public class GameHook extends AppLifecycleCallback {
         } catch (Throwable t) { return -1; }
     }
 
-    private double readDouble(RandomAccessFile mem, long a) {
-        long v = readLong(mem, a);
-        return v == -1 ? -999 : Double.longBitsToDouble(v);
+    private boolean isHeap(long v) {
+        if (v < 0x1000L) return false;
+        for (long[] r : RW) if (v >= r[0] && v < r[1]) return true;
+        return false;
     }
+
+    private boolean isLib(long v) {
+        for (long[] r : LIBR) if (v >= r[0] && v < r[1]) return true;
+        return false;
+    }
+
+    private String tag(long v) {
+        if (isLib(v)) return "LIB";
+        for (long[] r : LIBR) { }
+        if (v < 0x1000L) return "-";
+        for (long[] r : RW) if (v >= r[0] && v < r[1]) return "HEAP";
+        return "-";
+    }
+
+    private static long ld(byte[] b, int o) {
+        long v = 0;
+        for (int k = 7; k >= 0; k--) v = (v << 8) | (b[o + k] & 0xFFL);
+        return v;
+    }
+
+    private static String hx(long v) { return Long.toHexString(v); }
+
+    private static String hx(byte[] b) {
+        StringBuilder s = new StringBuilder();
+        for (byte x : b) {
+            int v = x & 0xFF;
+            s.append(Character.forDigit(v >> 4, 16)).append(Character.forDigit(v & 15, 16));
+        }
+        return s.toString();
+    }
+
+    private void set(Handler h, String s) { h.post(() -> { if (box != null) box.setText(s); }); }
+    private void sleep(int ms) { try { Thread.sleep(ms); } catch (InterruptedException ignored) { } }
 
     private TextView addBox(Context ctx, String text) {
         try {
             WindowManager wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
             TextView tv = new TextView(ctx);
             tv.setText(text);
-            tv.setTextSize(7f);
+            tv.setTextSize(6f);
             tv.setTextColor(Color.WHITE);
             tv.setBackgroundColor(0xaa000000);
-            tv.setPadding(10, 10, 10, 10);
+            tv.setPadding(8, 8, 8, 8);
             int type = Build.VERSION.SDK_INT >= 26
                     ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
                     : WindowManager.LayoutParams.TYPE_PHONE;
