@@ -7,26 +7,27 @@ import android.graphics.PixelFormat;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.WindowManager;
 import android.widget.TextView;
 
-import java.io.File;
-import java.io.FileWriter;
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.RandomAccessFile;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 
 import top.niunaijun.blackbox.app.configuration.AppLifecycleCallback;
 
 public class GameHook extends AppLifecycleCallback {
 
+    private static final String TAG = "PredictorHook";
     private static final String GAME = "com.miniclip.carrom";
+    private static final String APK = "split_config.arm64_v8a.apk";
 
-    private static final int PAGE = 0x1000;
-    private static final int CHUNK = 0x10000;
-    private static final int MAXP = 150000;
-    private static final int MAXCHG = 12000;
+    private static final long VTABLE_OFF = 0x0296f2a0L;
+    private static final long TABLELOGIC_OFF = 0x3F0L;
 
     private static volatile TextView box;
     private static volatile boolean started = false;
@@ -37,165 +38,137 @@ public class GameHook extends AppLifecycleCallback {
         if (!GAME.equals(packageName) || application == null) return;
         if (started) return;
         started = true;
+
         final Application app = application;
         new Thread(() -> {
             final Handler h = new Handler(Looper.getMainLooper());
-            h.post(() -> box = addBox(app, "starting..."));
-            for (int i = 0; i < 30; i++) {
-                try { Thread.sleep(6000); } catch (InterruptedException ignored) { }
-                if (i == 0) continue;
-                String rep = work(i * 6);
-                h.post(() -> { if (box != null) box.setText(rep); });
-                write(app, "v20_report.txt", rep);
+            h.post(() -> box = addBox(app, "waiting for engine..."));
+            set(h, "waiting for engine...");
+
+            long base = -1;
+            int apkLines = 0;
+            for (int i = 0; i < 240; i++) {
+                long[] r = findBase();
+                apkLines = (int) r[1];
+                if (r[0] >= 0) { base = r[0]; break; }
+                set(h, "waiting for engine...\napkLines=" + apkLines + " t=" + i);
+                sleep(500);
             }
+            if (base < 0) {
+                set(h, "NO BASE\napkLines=" + apkLines + "\nmaps has no " + APK);
+                return;
+            }
+            long vt = base + VTABLE_OFF;
+            set(h, "base=0x" + Long.toHexString(base) + "\nvtable=0x" + Long.toHexString(vt)
+                    + "\nscanning...");
+
+            List<Long> hits = scan(vt);
+            StringBuilder sb = new StringBuilder();
+            sb.append("v9 base=0x").append(Long.toHexString(base)).append("\n");
+            sb.append("vtable=0x").append(Long.toHexString(vt)).append("\n");
+            sb.append("hits=").append(hits.size()).append("\n");
+            try (RandomAccessFile mem = new RandomAccessFile("/proc/self/mem", "r")) {
+                int n = 0;
+                for (Long a : hits) {
+                    long tl = readLong(mem, a + TABLELOGIC_OFF);
+                    sb.append("0x").append(Long.toHexString(a))
+                      .append(" -> +0x3F0=0x").append(Long.toHexString(tl)).append("\n");
+                    if (++n >= 8) break;
+                }
+            } catch (Throwable t) {
+                sb.append("mem ").append(t).append("\n");
+            }
+            Log.d(TAG, sb.toString());
+            set(h, sb.toString());
         }).start();
     }
 
-    @Override
-    public boolean onStoragePermissionNeeded(String packageName, int userId) { return false; }
+    private void set(Handler h, String s) {
+        h.post(() -> { if (box != null) box.setText(s); });
+    }
 
-    private String work(int t) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("Predictor v20 t=").append(t).append("s pid=")
-          .append(android.os.Process.myPid()).append("\n");
-        if (!Mem.open()) { sb.append("MEM FAIL\n"); return sb.toString(); }
+    private void sleep(int ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException ignored) { }
+    }
 
-        List<Mem.Region> heap = new ArrayList<>();
-        for (Mem.Region r : Mem.regions()) {
-            if (!r.rw()) continue;
-            String p = r.path;
-            if (p.startsWith("[stack") || p.startsWith("[vvar") || p.startsWith("[vsys")) continue;
-            if (p.contains("jit-cache")) continue;
-            if (p.contains(".art") || p.contains(".oat") || p.contains(".vdex") || p.contains(".dex")) continue;
-            heap.add(r);
-        }
+    private long[] findBase() {
+        long best = -1;
+        long lines = 0;
+        try (BufferedReader r = new BufferedReader(new FileReader("/proc/self/maps"))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (!line.contains(APK)) continue;
+                lines++;
+                String[] p = line.split("\\s+");
+                if (p.length < 3) continue;
+                int dash = p[0].indexOf('-');
+                if (dash < 0) continue;
+                long start = Long.parseLong(p[0].substring(0, dash), 16);
+                long off = Long.parseLong(p[2], 16);
+                long b = start - off;
+                if (best < 0 || b < best) best = b;
+            }
+        } catch (Throwable t) { }
+        return new long[]{best, lines};
+    }
 
-        int np = 0;
-        for (Mem.Region r : heap) np += (int) ((r.end - r.start) / PAGE);
-        if (np > MAXP) np = MAXP;
-        if (np < 32) np = 32;
-        long[] pa = new long[np];
-        long[] ph = new long[np];
-        int idx = 0;
+    private List<Long> scan(long vt) {
+        List<Long> hits = new ArrayList<>();
+        try (BufferedReader r = new BufferedReader(new FileReader("/proc/self/maps"))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (!line.contains("rw-p")) continue;
+                String[] p = line.split("\\s+");
+                if (p.length < 3) continue;
+                int dash = p[0].indexOf('-');
+                if (dash < 0) continue;
+                long start = Long.parseLong(p[0].substring(0, dash), 16);
+                long end = Long.parseLong(p[0].substring(dash + 1), 16);
+                long len = end - start;
+                if (len <= 0 || len > (32L << 20)) continue;
+                scanRange(start, end, vt, hits);
+                if (hits.size() > 300) break;
+            }
+        } catch (Throwable t) { }
+        return hits;
+    }
 
-        outer1:
-        for (Mem.Region r : heap) {
-            long p = r.start;
-            while (p + PAGE <= r.end) {
-                int len = (int) Math.min((long) CHUNK, r.end - p);
-                len = (len / PAGE) * PAGE;
-                if (len <= 0) break;
-                byte[] buf = Mem.read(p, len);
-                if (buf == null || buf.length < PAGE) { p += len; continue; }
-                for (int o = 0; o + PAGE <= buf.length; o += PAGE) {
-                    if (idx >= np) break outer1;
-                    pa[idx] = p + o;
-                    ph[idx] = hash(buf, o, PAGE);
-                    idx++;
+    private void scanRange(long start, long end, long vt, List<Long> hits) {
+        try (RandomAccessFile mem = new RandomAccessFile("/proc/self/mem", "r")) {
+            long addr = start;
+            byte[] buf = new byte[1 << 20];
+            while (addr < end) {
+                int want = (int) Math.min(buf.length, end - addr);
+                int got;
+                try {
+                    mem.seek(addr);
+                    got = mem.read(buf, 0, want);
+                } catch (Throwable t) {
+                    addr += want;
+                    continue;
                 }
-                p += len;
+                if (got <= 0) { addr += want; continue; }
+                for (int i = 0; i + 8 <= got; i += 8) {
+                    long v = 0;
+                    for (int b = 7; b >= 0; b--) v = (v << 8) | (buf[i + b] & 0xFFL);
+                    if (v == vt) hits.add(addr + i);
+                }
+                addr += got;
             }
-        }
-
-        try { Thread.sleep(2000); } catch (InterruptedException ignored) { }
-
-        List<Integer> chg = new ArrayList<>();
-        List<byte[]> snap = new ArrayList<>();
-        for (int i = 0; i < idx; i++) {
-            if (chg.size() >= MAXCHG) break;
-            byte[] buf = Mem.read(pa[i], PAGE);
-            if (buf == null) continue;
-            if (hash(buf, 0, PAGE) == ph[i]) continue;
-            chg.add(i);
-            snap.add(buf);
-        }
-        sb.append("pages=").append(idx).append(" changed=").append(chg.size()).append("\n");
-
-        try { Thread.sleep(2000); } catch (InterruptedException ignored) { }
-
-        List<long[]> movers = new ArrayList<>();
-        for (int c = 0; c < chg.size(); c++) {
-            byte[] a = snap.get(c);
-            byte[] b = Mem.read(pa[chg.get(c)], PAGE);
-            if (b == null) continue;
-            for (int o = 0; o + 4 <= PAGE; o += 4) {
-                float fa = Float.intBitsToFloat((int) ld32(a, o));
-                float fb = Float.intBitsToFloat((int) ld32(b, o));
-                if (Float.isNaN(fa) || Float.isNaN(fb)) continue;
-                if (Float.isInfinite(fa) || Float.isInfinite(fb)) continue;
-                if (Math.abs(fa) > 2000f || Math.abs(fb) > 2000f) continue;
-                float d = Math.abs(fb - fa);
-                if (d < 0.5f || d > 2000f) continue;
-                movers.add(new long[]{pa[chg.get(c)] + o,
-                        Float.floatToIntBits(fa), Float.floatToIntBits(fb)});
-            }
-        }
-        Collections.sort(movers, (x, y) -> Float.compare(
-                Math.abs(Float.intBitsToFloat((int) y[2]) - Float.intBitsToFloat((int) y[1])),
-                Math.abs(Float.intBitsToFloat((int) x[2]) - Float.intBitsToFloat((int) x[1]))));
-
-        sb.append("movers=").append(movers.size()).append("\n");
-        int pr = 0;
-        for (long[] m : movers) {
-            if (pr++ >= 40) break;
-            float fa = Float.intBitsToFloat((int) m[1]);
-            float fb = Float.intBitsToFloat((int) m[2]);
-            sb.append("M=0x").append(hx(m[0]))
-              .append(" ").append(fm(fa)).append("->").append(fm(fb))
-              .append(" d=").append(String.format("%.1f", Math.abs(fb - fa)));
-            byte[] ctx = Mem.read(m[0], 40);
-            if (ctx != null) {
-                sb.append(" ctx");
-                for (int j = 0; j < 8; j++) sb.append(" ").append(fm(f32(ctx, j * 4)));
-            }
-            sb.append("\n");
-        }
-        return sb.toString();
+        } catch (Throwable t) { }
     }
 
-    private static long hash(byte[] b, int off, int len) {
-        long h = 0xcbf29ce484222325L;
-        int end = off + len;
-        for (int i = off; i + 8 <= end; i += 8) {
-            h ^= ld(b, i);
-            h *= 0x100000001b3L;
-        }
-        return h;
-    }
-
-    private static long ld(byte[] b, int o) {
-        long v = 0;
-        for (int k = 7; k >= 0; k--) v = (v << 8) | (b[o + k] & 0xffL);
-        return v;
-    }
-
-    private static long ld32(byte[] b, int o) {
-        return (b[o] & 0xffL) | ((b[o + 1] & 0xffL) << 8)
-                | ((b[o + 2] & 0xffL) << 16) | ((b[o + 3] & 0xffL) << 24);
-    }
-
-    private static float f32(byte[] b, int o) { return Float.intBitsToFloat((int) ld32(b, o)); }
-
-    private static String fm(float f) {
-        if (Float.isNaN(f)) return "nan";
-        if (Float.isInfinite(f)) return f > 0 ? "inf" : "-inf";
-        float a = Math.abs(f);
-        if (a == 0f) return "0";
-        if (a >= 1e-3f && a < 1e6f) return String.format("%.2f", f);
-        return "~" + Integer.toHexString(Float.floatToIntBits(f));
-    }
-
-    private static String hx(long v) { return Long.toHexString(v); }
-
-    private void write(Application app, String name, String text) {
+    private long readLong(RandomAccessFile mem, long addr) {
         try {
-            File d = app.getExternalFilesDir(null);
-            if (d == null) d = app.getFilesDir();
-            if (!d.exists()) d.mkdirs();
-            FileWriter w = new FileWriter(new File(d, name), false);
-            w.write(text);
-            w.close();
-        } catch (Throwable ignored) { }
+            byte[] b = new byte[8];
+            mem.seek(addr);
+            mem.readFully(b);
+            long v = 0;
+            for (int i = 7; i >= 0; i--) v = (v << 8) | (b[i] & 0xFFL);
+            return v;
+        } catch (Throwable t) {
+            return -1;
+        }
     }
 
     private TextView addBox(Context ctx, String text) {
@@ -203,10 +176,10 @@ public class GameHook extends AppLifecycleCallback {
             WindowManager wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
             TextView tv = new TextView(ctx);
             tv.setText(text);
-            tv.setTextSize(6f);
+            tv.setTextSize(8f);
             tv.setTextColor(Color.WHITE);
-            tv.setBackgroundColor(0xcc000000);
-            tv.setPadding(10, 10, 10, 10);
+            tv.setBackgroundColor(0xaa000000);
+            tv.setPadding(12, 12, 12, 12);
             int type = Build.VERSION.SDK_INT >= 26
                     ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
                     : WindowManager.LayoutParams.TYPE_PHONE;
@@ -219,9 +192,12 @@ public class GameHook extends AppLifecycleCallback {
                             | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                     PixelFormat.TRANSLUCENT);
             lp.gravity = Gravity.TOP | Gravity.START;
-            lp.y = 60;
+            lp.y = 100;
             wm.addView(tv, lp);
             return tv;
-        } catch (Throwable t) { return null; }
+        } catch (Throwable t) {
+            Log.e(TAG, "addBox " + t);
+            return null;
+        }
     }
 }
