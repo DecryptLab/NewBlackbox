@@ -55,6 +55,7 @@ public class GameHook extends AppLifecycleCallback {
     static final long CLS_OFF_DEFAULT = 0x28E4160L;
 
     static final int OFF = 0, FULL = 1, A1 = 2, A2 = 3, A3 = 4;
+    static final int COLOUR_AUTO = 0, COLOUR_BRIGHT = 1, COLOUR_DARK = 2;
 
     static final int F_STRIKER = 0x3c0, F_PUCK = 0x3d8, F_POCKET = 0x3f0;
 
@@ -62,6 +63,8 @@ public class GameHook extends AppLifecycleCallback {
     static volatile boolean busy = false;
     static volatile boolean stopAll = false;
     static volatile int dbg = 1;
+    static volatile int ourColour = COLOUR_AUTO;
+    static volatile double dragScale = 1.0;
 
     static int shotsFired = 0, pots = 0, fails = 0, noTable = 0;
 
@@ -122,10 +125,13 @@ public class GameHook extends AppLifecycleCallback {
                 sp = app.getSharedPreferences("pred", Context.MODE_PRIVATE);
                 dbg = sp.getInt("dbg", 1);
                 clsOff = sp.getLong("clsoff", CLS_OFF_DEFAULT);
+                ourColour = sp.getInt("colour", COLOUR_AUTO);
+                dragScale = sp.getFloat("drag", 1.0f);
             } catch (Throwable t) { Log.e(TAG, "init " + t); }
             try { initInject(); } catch (Throwable t) { log(1, "inject init failed: " + t); }
             new Handler(Looper.getMainLooper()).post(GameHook::buildUi);
-            log(1, "v4 boot proc=" + processName + " inject=" + (imInject != null));
+            log(1, "v5 boot proc=" + processName + " inject=" + (imInject != null)
+                    + " colour=" + ourColour + " drag=" + dragScale);
             if (!GAME.equals(processName) && !(GAME + ":main").equals(processName))
                 log(1, "NOT main process, table lives elsewhere");
             startWatchdog();
@@ -173,14 +179,22 @@ public class GameHook extends AppLifecycleCallback {
             panel.addView(r1);
 
             LinearLayout r2 = new LinearLayout(app);
-            r2.addView(btn("DBG+", -1));
-            r2.addView(btn("DBG-", -2));
-            r2.addView(btn("CAL", -3));
-            r2.addView(btn("SHOT", -4));
-            r2.addView(btn("DUMP", -5));
-            r2.addView(btn("LOG", -6));
-            r2.addView(btn("HIDE", -7));
+            r2.addView(btn("W", -9));
+            r2.addView(btn("B", -10));
+            r2.addView(btn("AUTO", -8));
+            r2.addView(btn("D+", -11));
+            r2.addView(btn("D-", -12));
             panel.addView(r2);
+
+            LinearLayout r3 = new LinearLayout(app);
+            r3.addView(btn("DBG+", -1));
+            r3.addView(btn("DBG-", -2));
+            r3.addView(btn("CAL", -3));
+            r3.addView(btn("SHOT", -4));
+            r3.addView(btn("DUMP", -5));
+            r3.addView(btn("LOG", -6));
+            r3.addView(btn("HIDE", -7));
+            panel.addView(r3);
 
             statusView = new TextView(app);
             statusView.setTextSize(8f);
@@ -246,6 +260,11 @@ public class GameHook extends AppLifecycleCallback {
             case -5: new Thread(GameHook::dumpState).start(); return;
             case -6: logOpen = !logOpen; scroller.setVisibility(logOpen ? View.VISIBLE : View.GONE); return;
             case -7: togglePanel(); return;
+            case -8: ourColour = COLOUR_AUTO; sp.edit().putInt("colour", ourColour).apply(); log(1, "colour AUTO"); return;
+            case -9: ourColour = COLOUR_BRIGHT; sp.edit().putInt("colour", ourColour).apply(); log(1, "colour BRIGHT"); return;
+            case -10: ourColour = COLOUR_DARK; sp.edit().putInt("colour", ourColour).apply(); log(1, "colour DARK"); return;
+            case -11: dragScale = Math.min(1.8, dragScale + 0.1); sp.edit().putFloat("drag", (float) dragScale).apply(); log(1, "drag " + String.format(Locale.US, "%.1f", dragScale)); return;
+            case -12: dragScale = Math.max(0.4, dragScale - 0.1); sp.edit().putFloat("drag", (float) dragScale).apply(); log(1, "drag " + String.format(Locale.US, "%.1f", dragScale)); return;
             default:
                 mode = code;
                 stopAll = false;
@@ -256,7 +275,9 @@ public class GameHook extends AppLifecycleCallback {
     }
 
     static void status(String s) {
-        new Handler(Looper.getMainLooper()).post(() -> { if (statusView != null) statusView.setText(s); });
+        new Handler(Looper.getMainLooper()).post(() -> {
+            if (statusView != null) statusView.setText(s + " | c" + ourColour + " d" + String.format(Locale.US, "%.1f", dragScale));
+        });
     }
 
     static class DragTouch implements View.OnTouchListener {
@@ -321,7 +342,8 @@ public class GameHook extends AppLifecycleCallback {
         try {
             File f = new File(outDir, "dump_" + System.currentTimeMillis() + ".txt");
             FileWriter w = new FileWriter(f);
-            w.write("dbg=" + dbg + " mode=" + mode + " shots=" + shotsFired + " pots=" + pots + " fails=" + fails + " noTable=" + noTable + "\n");
+            w.write("dbg=" + dbg + " mode=" + mode + " colour=" + ourColour + " drag=" + dragScale + "\n");
+            w.write("shots=" + shotsFired + " pots=" + pots + " fails=" + fails + " noTable=" + noTable + "\n");
             w.write("sw=" + sw + " sh=" + sh + " PW=" + PW + " PH=" + PH + "\n");
             w.write("libBase=0x" + Long.toHexString(libBase) + " clsOff=0x" + Long.toHexString(clsOff) + " rwN=" + rwN + "\n");
             w.write("cal=" + CX + "," + CY + "," + SCX + "," + SCY + " ok=" + calOk + "\n");
@@ -812,12 +834,36 @@ public class GameHook extends AppLifecycleCallback {
                 if (acc >= n2 / 2) { med = v; break; }
             }
         }
-        log(2, "pucks " + pucks.length + " med " + med + " " + Arrays.toString(plv));
+
+        int col = ourColour;
+        if (col == COLOUR_AUTO) {
+            double bd = 0, dd = 0;
+            int bn = 0, dn = 0;
+            for (int i = 0; i < plv.length; i++) {
+                if (plv[i] < 0) continue;
+                double y = py(rd(pucks[i] + 0x260));
+                if (plv[i] >= med) { bd += (PH - y); bn++; } else { dd += (PH - y); dn++; }
+            }
+            col = (bn == 0) ? COLOUR_DARK : (dn == 0) ? COLOUR_BRIGHT : ((bd / bn) <= (dd / dn) ? COLOUR_BRIGHT : COLOUR_DARK);
+        }
+        int mine = 0;
+        for (int i = 0; i < plv.length; i++) {
+            if (plv[i] < 0) continue;
+            boolean isBright = plv[i] >= med;
+            if ((col == COLOUR_BRIGHT && !isBright) || (col == COLOUR_DARK && isBright)) continue;
+            mine++;
+        }
+        log(2, "pucks " + pucks.length + " med " + med + " col " + col + " mine " + mine + " " + Arrays.toString(plv));
+        if (mine == 0) log(1, "no pucks of our colour, using all");
 
         int bp = -1, bq = -1, bblk = 0, bfoul = 0;
         double bestSc = 1e18, gxs = 0, gys = 0;
         for (int k = 0; k < pucks.length; k++) {
             if (plv[k] < 0) continue;
+            if (mine > 0) {
+                boolean isBright = plv[k] >= med;
+                if ((col == COLOUR_BRIGHT && !isBright) || (col == COLOUR_DARK && isBright)) continue;
+            }
             double pxs = px(rd(pucks[k] + 0x258)), pys = py(rd(pucks[k] + 0x260));
             if (pxs < 3 || pxs > PW - 4 || pys < 3 || pys > PH - 4) continue;
             for (int q = 0; q < pockets.length; q++) {
@@ -861,7 +907,7 @@ public class GameHook extends AppLifecycleCallback {
 
         double ax = gxs - sx, ay = gys - sy, AL = Math.hypot(ax, ay);
         double ux = ax / AL, uy = ay / AL;
-        int drag = (int) (140 * (SCX + SCY) / 2 / 0.888);
+        int drag = (int) (140 * (SCX + SCY) / 2 / 0.888 * dragScale);
         int tx = Math.max(1, Math.min(PW - 2, (int) (sx - ux * drag)));
         int ty = Math.max(1, Math.min(PH - 2, (int) (sy - uy * drag)));
 
