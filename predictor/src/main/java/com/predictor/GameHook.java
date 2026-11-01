@@ -15,7 +15,6 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
-import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.InputDevice;
 import android.view.InputEvent;
@@ -98,6 +97,7 @@ public class GameHook extends AppLifecycleCallback {
     static boolean calOk = false;
     static int[] PIX;
     static int PW, PH;
+    static int[] QUEUE = new int[400000];
 
     static final double POCKET = 230.008;
     static final String[] SU_PATHS = {"/system/bin/su", "/system/xbin/su", "/sbin/su", "/debug_ramdisk/su"};
@@ -188,8 +188,7 @@ public class GameHook extends AppLifecycleCallback {
             logView.setTextSize(9f);
             logView.setTextColor(Color.WHITE);
             scroller.addView(logView);
-            LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(-1, dp(200));
-            panel.addView(scroller, slp);
+            panel.addView(scroller, new LinearLayout.LayoutParams(-1, dp(200)));
             scroller.setVisibility(View.GONE);
 
             WindowManager.LayoutParams plp = new WindowManager.LayoutParams(
@@ -220,8 +219,8 @@ public class GameHook extends AppLifecycleCallback {
             b.setPadding(0, 0, 0, 0);
             b.setBackgroundColor(0xFF1E3A5F);
             b.setTextColor(Color.WHITE);
-            int code = codes[i];
-            String lab = labels[i];
+            final int code = codes[i];
+            final String lab = labels[i];
             b.setOnClickListener(v -> onButton(lab, code));
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(38), 1f);
             lp.setMargins(dp(1), dp(1), dp(1), dp(1));
@@ -317,8 +316,6 @@ public class GameHook extends AppLifecycleCallback {
             }
         });
     }
-
-    /* ================= selftest ================= */
 
     static void selfTest() {
         log(0, "== SELFTEST ==");
@@ -438,7 +435,7 @@ public class GameHook extends AppLifecycleCallback {
             if (!latch.await(1500, TimeUnit.MILLISECONDS)) { log(0, "pixelcopy timeout"); return false; }
             PW = w; PH = h;
             PIX = new int[w * h];
-            b.getPixels(PIX, 0, w, 0, 0, w, h);
+            b.getPixels(PIX, 0, PW, 0, 0, w, h);
             return true;
         } catch (Throwable t) { log(0, "pixelcopy " + t); return false; }
     }
@@ -497,6 +494,14 @@ public class GameHook extends AppLifecycleCallback {
         if (x < 0 || y < 0 || x >= PW || y >= PH) return 0;
         int c = PIX[y * PW + x];
         return ((c >> 16) & 0xFF) - Math.max((c >> 8) & 0xFF, c & 0xFF);
+    }
+
+    static boolean boardPix(int x, int y) {
+        if (x < 0 || y < 0 || x >= PW || y >= PH) return false;
+        int c = PIX[y * PW + x];
+        int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+        int l = (r + g + b) / 3;
+        return l > 112 && r - b > 40 && r - g > 8;
     }
 
     /* ================= memory ================= */
@@ -668,73 +673,118 @@ public class GameHook extends AppLifecycleCallback {
     static boolean calibrate() {
         calOk = false;
         if (PIX == null) return false;
-        int y0 = PH * 10 / 100, y1 = PH * 96 / 100;
+
+        int bx0 = PW, by0 = PH, bx1 = -1, by1 = -1;
+        long bestArea = 0;
+        boolean[] seen = new boolean[PW * PH];
+        for (int y = 0; y < PH; y += 2) {
+            for (int x = 0; x < PW; x += 2) {
+                int i = y * PW + x;
+                if (seen[i] || !boardPix(x, y)) continue;
+                int qh = 0, qt = 0, cnt = 0;
+                int mnx = x, mxx = x, mny = y, mxy = y;
+                QUEUE[qt++] = i; seen[i] = true;
+                while (qh < qt && cnt < 390000) {
+                    int p = QUEUE[qh++];
+                    int px2 = p % PW, py2 = p / PW;
+                    cnt++;
+                    if (px2 < mnx) mnx = px2;
+                    if (px2 > mxx) mxx = px2;
+                    if (py2 < mny) mny = py2;
+                    if (py2 > mxy) mxy = py2;
+                    for (int dy = -2; dy <= 2; dy += 2) for (int dx = -2; dx <= 2; dx += 2) {
+                        int nx = px2 + dx, ny = py2 + dy;
+                        if (nx < 0 || ny < 0 || nx >= PW || ny >= PH) continue;
+                        int j = ny * PW + nx;
+                        if (seen[j] || !boardPix(nx, ny)) continue;
+                        seen[j] = true;
+                        if (qt < 390000) QUEUE[qt++] = j;
+                    }
+                }
+                if (cnt > bestArea) {
+                    bestArea = cnt;
+                    bx0 = mnx; by0 = mny; bx1 = mxx; by1 = mxy;
+                }
+            }
+        }
+        if (bx1 < 0) { log(0, "CAL: board not found"); return false; }
+        int bw = bx1 - bx0 + 1, bh = by1 - by0 + 1;
+        log(1, "board " + bx0 + "," + by0 + "-" + bx1 + "," + by1 + " a" + bestArea);
+        if (bw < PW * 0.45 || bh < PH * 0.3) { log(0, "CAL: board too small " + bw + "x" + bh); return false; }
+
+        int ix0 = bx0 + bw * 4 / 100, ix1 = bx1 - bw * 4 / 100;
+        int iy0 = by0 + bh * 4 / 100, iy1 = by1 - bh * 4 / 100;
+
         boolean[] vis = new boolean[PW * PH];
-        int[] hx = new int[24], hy = new int[24];
+        int[] hx = new int[32], hy = new int[32];
         int hn = 0;
-        int scanned = 0;
-        for (int y = y0; y < y1; y++) {
-            for (int x = 0; x < PW; x++) {
+        for (int y = iy0; y < iy1; y++) {
+            for (int x = ix0; x < ix1; x++) {
                 int idx = y * PW + x;
                 if (vis[idx]) continue;
                 int l = lum(x, y);
-                if (l > 115 || red(x, y) < 22) continue;
-                scanned++;
-                int[] qx = new int[8000], qy = new int[8000];
+                if (l > 120 || red(x, y) < 18) continue;
                 int qh = 0, qt = 0, cnt = 0;
                 long ax = 0, ay = 0;
                 int mnx = x, mxx = x, mny = y, mxy = y;
-                qx[qt] = x; qy[qt] = y; qt++; vis[idx] = true;
-                while (qh < qt && cnt < 8000) {
-                    int cxp = qx[qh], cyp = qy[qh]; qh++; ax += cxp; ay += cyp; cnt++;
-                    if (cxp < mnx) mnx = cxp;
-                    if (cxp > mxx) mxx = cxp;
-                    if (cyp < mny) mny = cyp;
-                    if (cyp > mxy) mxy = cyp;
+                QUEUE[qt++] = idx; vis[idx] = true;
+                while (qh < qt && cnt < 12000) {
+                    int p = QUEUE[qh++];
+                    int px2 = p % PW, py2 = p / PW;
+                    cnt++; ax += px2; ay += py2;
+                    if (px2 < mnx) mnx = px2;
+                    if (px2 > mxx) mxx = px2;
+                    if (py2 < mny) mny = py2;
+                    if (py2 > mxy) mxy = py2;
                     for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
-                        int bx = cxp + dx, by = cyp + dy;
-                        if (bx < 1 || by < y0 || bx >= PW - 1 || by >= y1) continue;
-                        int j = by * PW + bx;
+                        int nx = px2 + dx, ny = py2 + dy;
+                        if (nx < ix0 || ny < iy0 || nx >= ix1 || ny >= iy1) continue;
+                        int j = ny * PW + nx;
                         if (vis[j]) continue;
-                        int ll = lum(bx, by);
-                        if (ll > 115 || red(bx, by) < 22) continue;
+                        int ll = lum(nx, ny);
+                        if (ll > 120 || red(nx, ny) < 18) continue;
                         vis[j] = true;
-                        if (qt < 8000) { qx[qt] = bx; qy[qt] = by; qt++; }
+                        if (qt < 12000) QUEUE[qt++] = j;
                     }
                 }
-                if (cnt < 300 || cnt > 9000) continue;
+                if (cnt < 250 || cnt > 12000) continue;
                 int w = mxx - mnx + 1, h = mxy - mny + 1;
-                if (w < 18 || h < 18 || w > 130 || h > 130) continue;
+                if (w < 18 || h < 18 || w > 150 || h > 150) continue;
                 double ar = (double) w / h;
                 if (ar < 0.6 || ar > 1.7) continue;
-                if ((double) cnt / (w * h) < 0.42) continue;
-                int mx = (int) (ax / cnt), my = (int) (ay / cnt);
-                if (hn < 24) { hx[hn] = mx; hy[hn] = my; hn++; }
+                if ((double) cnt / (w * h) < 0.4) continue;
+                if (hn < 32) { hx[hn] = (int) (ax / cnt); hy[hn] = (int) (ay / cnt); hn++; }
             }
         }
-        log(1, "pocket cand " + hn + " from " + scanned);
+        log(1, "pocket cand " + hn);
         if (hn < 4) { log(0, "CAL: only " + hn + " candidates"); return false; }
+
         int[] cx4 = {-1, -1}, cy4 = {-1, -1};
         for (int q = 0; q < 4; q++) {
             int right = q & 1, low = q >> 1;
-            long bx = right == 1 ? PW : 0, by = low == 1 ? y1 : 0;
+            long axx = right == 1 ? ix1 : ix0, ayy = low == 1 ? iy1 : iy0;
             long bd = Long.MAX_VALUE;
             int bi = -1;
             for (int i = 0; i < hn; i++) {
-                long dx = hx[i] - bx, dy = hy[i] - by;
+                long dx = hx[i] - axx, dy = hy[i] - ayy;
                 long d = dx * dx + dy * dy;
                 if (d < bd) { bd = d; bi = i; }
             }
             if (bi >= 0) { cx4[right] = hx[bi]; cy4[low] = hy[bi]; }
         }
         if (cx4[0] <= 0 || cx4[1] <= 0 || cy4[0] <= 0 || cy4[1] <= 0) { log(0, "CAL: corners missing"); return false; }
+        if (cx4[1] - cx4[0] < bw * 0.5 || cy4[1] - cy4[0] < bh * 0.5) { log(0, "CAL: corners too close"); return false; }
+
         double nx = (cx4[1] - cx4[0]) / (2 * POCKET);
         double ny = (cy4[1] - cy4[0]) / (2 * POCKET);
+        double ccx = (cx4[0] + cx4[1]) / 2.0, ccy = (cy4[0] + cy4[1]) / 2.0;
         log(1, String.format(Locale.US, "holes L%d R%d T%d B%d sx%.3f sy%.3f", cx4[0], cx4[1], cy4[0], cy4[1], nx, ny));
-        if (nx < 0.4 || nx > 2.6 || ny < 0.4 || ny > 2.6) { log(0, "CAL: scale out of range"); return false; }
-        if (Math.abs(nx - ny) > 0.7) { log(0, "CAL: aspect mismatch"); return false; }
-        CX = (cx4[0] + cx4[1]) / 2;
-        CY = (cy4[0] + cy4[1]) / 2;
+        if (Math.abs(ccx - (bx0 + bw / 2.0)) > bw * 0.15) { log(0, "CAL: x centre off"); return false; }
+        if (Math.abs(ccy - (by0 + bh / 2.0)) > bh * 0.15) { log(0, "CAL: y centre off"); return false; }
+        if (Math.abs(nx - ny) > 0.75) { log(0, String.format(Locale.US, "CAL: aspect %.2f/%.2f", nx, ny)); return false; }
+
+        CX = (int) ccx;
+        CY = (int) ccy;
         SCX = nx; SCY = ny;
         calOk = true;
         return true;
