@@ -1,5 +1,6 @@
 package com.predictor;
 
+import android.app.Activity;
 import android.app.Application;
 import android.content.Context;
 import android.content.SharedPreferences;
@@ -8,6 +9,7 @@ import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
@@ -17,6 +19,10 @@ import android.view.Gravity;
 import android.view.InputDevice;
 import android.view.InputEvent;
 import android.view.MotionEvent;
+import android.view.PixelCopy;
+import android.view.SurfaceView;
+import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.LinearLayout;
@@ -36,6 +42,8 @@ import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import top.niunaijun.blackbox.app.configuration.AppLifecycleCallback;
 
@@ -48,27 +56,28 @@ public class GameHook extends AppLifecycleCallback {
 
     static final int OFF = 0, FULL = 1, A1 = 2, A2 = 3, A3 = 4;
 
-    static final int F_OFF = 0x3c0, F_PUCK = 0x3d8, F_POCKET = 0x3f0;
-    static final int F_STRIKER = 0x3c0;
+    static final int F_STRIKER = 0x3c0, F_PUCK = 0x3d8, F_POCKET = 0x3f0;
 
     static volatile int mode = OFF;
     static volatile boolean busy = false;
     static volatile boolean stopAll = false;
     static volatile int dbg = 1;
-    static volatile boolean armed = true;
 
     static int shotsFired = 0, pots = 0, fails = 0, noTable = 0;
 
     static Application app;
+    static volatile Activity act;
     static WindowManager wm;
     static LinearLayout panel;
+    static TextView bubble;
     static TextView logView;
     static TextView statusView;
     static ScrollView scroller;
+    static boolean logOpen = false;
+    static boolean panelOpen = false;
     static File outDir;
     static SharedPreferences sp;
     static final StringBuilder LOGBUF = new StringBuilder();
-    static final int LOGBUF_MAX = 60000;
 
     static RandomAccessFile mem;
     static long libBase = 0;
@@ -88,12 +97,24 @@ public class GameHook extends AppLifecycleCallback {
     static int PW, PH;
 
     static final double POCKET = 230.008;
+    static final String[] SU_PATHS = {"/system/bin/su", "/system/xbin/su", "/sbin/su", "/debug_ramdisk/su"};
 
     @Override
     public void afterApplicationOnCreate(String pkg, String proc, Application a, int userId) {
         if (!GAME.equals(pkg) || a == null) return;
         app = a;
         final String processName = proc == null ? "?" : proc;
+
+        a.registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {
+            public void onActivityResumed(Activity x) { act = x; }
+            public void onActivityCreated(Activity x, Bundle b) {}
+            public void onActivityStarted(Activity x) {}
+            public void onActivityPaused(Activity x) {}
+            public void onActivityStopped(Activity x) {}
+            public void onActivitySaveInstanceState(Activity x, Bundle b) {}
+            public void onActivityDestroyed(Activity x) { if (act == x) act = null; }
+        });
+
         new Thread(() -> {
             try {
                 outDir = new File(Environment.getExternalStorageDirectory(), "CarromPredictor");
@@ -104,10 +125,9 @@ public class GameHook extends AppLifecycleCallback {
             } catch (Throwable t) { Log.e(TAG, "init " + t); }
             try { initInject(); } catch (Throwable t) { log(1, "inject init failed: " + t); }
             new Handler(Looper.getMainLooper()).post(GameHook::buildUi);
-            log(1, "v2 boot. pkg=" + pkg + " proc=" + processName + " inject=" + (imInject != null) + " dbg=" + dbg);
-            if (!GAME.equals(processName) && !(GAME + ":main").equals(processName)) {
-                log(1, "NOT main process -> table lives elsewhere, idling");
-            }
+            log(1, "v4 boot proc=" + processName + " inject=" + (imInject != null));
+            if (!GAME.equals(processName) && !(GAME + ":main").equals(processName))
+                log(1, "NOT main process, table lives elsewhere");
             startWatchdog();
         }).start();
     }
@@ -119,19 +139,38 @@ public class GameHook extends AppLifecycleCallback {
             wm = (WindowManager) app.getSystemService(Context.WINDOW_SERVICE);
             android.util.DisplayMetrics dm = new android.util.DisplayMetrics();
             wm.getDefaultDisplay().getRealMetrics(dm);
-            sw = dm.widthPixels; sh = dm.heightPixels;
+            sw = dm.widthPixels;
+            sh = dm.heightPixels;
 
-            LinearLayout root = new LinearLayout(app);
-            root.setOrientation(LinearLayout.VERTICAL);
-            root.setBackgroundColor(0xD9000000);
+            bubble = new TextView(app);
+            bubble.setText("AIM");
+            bubble.setTextSize(9f);
+            bubble.setTextColor(Color.WHITE);
+            bubble.setGravity(Gravity.CENTER);
+            bubble.setBackgroundColor(0xCC103050);
+            WindowManager.LayoutParams blp = new WindowManager.LayoutParams(
+                    96, 96, overlayType(),
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                            | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                    PixelFormat.TRANSLUCENT);
+            blp.gravity = Gravity.TOP | Gravity.START;
+            blp.x = 4;
+            blp.y = sh / 3;
+            bubble.setOnTouchListener(new DragTouch(blp));
+            bubble.setOnClickListener(v -> togglePanel());
+            wm.addView(bubble, blp);
+
+            panel = new LinearLayout(app);
+            panel.setOrientation(LinearLayout.VERTICAL);
+            panel.setBackgroundColor(0xE6000000);
 
             LinearLayout r1 = new LinearLayout(app);
             r1.addView(btn("FULL", FULL));
-            r1.addView(btn("A1cut", A1));
-            r1.addView(btn("A2full", A2));
-            r1.addView(btn("A3mem", A3));
+            r1.addView(btn("A1", A1));
+            r1.addView(btn("A2", A2));
+            r1.addView(btn("A3", A3));
             r1.addView(btn("STOP", OFF));
-            root.addView(r1);
+            panel.addView(r1);
 
             LinearLayout r2 = new LinearLayout(app);
             r2.addView(btn("DBG+", -1));
@@ -139,39 +178,55 @@ public class GameHook extends AppLifecycleCallback {
             r2.addView(btn("CAL", -3));
             r2.addView(btn("SHOT", -4));
             r2.addView(btn("DUMP", -5));
-            r2.addView(btn("CLR", -6));
-            root.addView(r2);
+            r2.addView(btn("LOG", -6));
+            r2.addView(btn("HIDE", -7));
+            panel.addView(r2);
 
             statusView = new TextView(app);
-            statusView.setTextSize(9f);
+            statusView.setTextSize(8f);
             statusView.setTextColor(Color.CYAN);
             statusView.setText("idle");
-            root.addView(statusView);
+            panel.addView(statusView);
 
             scroller = new ScrollView(app);
             logView = new TextView(app);
             logView.setTextSize(8f);
             logView.setTextColor(Color.WHITE);
             scroller.addView(logView);
-            root.addView(scroller, new LinearLayout.LayoutParams(-1, 300));
+            panel.addView(scroller, new LinearLayout.LayoutParams(-1, 210));
+            scroller.setVisibility(View.GONE);
 
-            WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                    -1, -2,
-                    Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                            : WindowManager.LayoutParams.TYPE_PHONE,
+            WindowManager.LayoutParams plp = new WindowManager.LayoutParams(
+                    -2, -2, overlayType(),
                     WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                             | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                     PixelFormat.TRANSLUCENT);
-            lp.gravity = Gravity.TOP;
-            wm.addView(root, lp);
-            panel = root;
+            plp.gravity = Gravity.TOP | Gravity.START;
+            plp.x = 0;
+            plp.y = 40;
+            wm.addView(panel, plp);
+            panel.setVisibility(View.GONE);
         } catch (Throwable t) { Log.e(TAG, "ui " + t); }
+    }
+
+    static int overlayType() {
+        return Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                : WindowManager.LayoutParams.TYPE_PHONE;
+    }
+
+    static void togglePanel() {
+        panelOpen = !panelOpen;
+        panel.setVisibility(panelOpen ? View.VISIBLE : View.GONE);
+        bubble.setBackgroundColor(panelOpen ? 0xCC804000 : 0xCC103050);
     }
 
     static Button btn(String t, int code) {
         Button b = new Button(app);
         b.setText(t);
-        b.setTextSize(9f);
+        b.setTextSize(8f);
+        b.setMinWidth(0);
+        b.setMinimumWidth(0);
+        b.setPadding(6, 0, 6, 0);
         b.setOnClickListener(v -> onButton(t, code));
         return b;
     }
@@ -184,15 +239,16 @@ public class GameHook extends AppLifecycleCallback {
                         if (!capture()) { log(1, "capture failed"); return; }
                         if (calibrate()) { log(1, String.format(Locale.US, "CAL OK cx%d cy%d sx%.3f sy%.3f", CX, CY, SCX, SCY)); saveCal(); }
                         else log(1, "CAL FAILED");
-                        status("cal " + (calOk ? "ok" : "fail"));
                      }).start(); return;
-            case -4: new Thread(() -> { if (!busy) { busy = true; try { oneShot(); } catch (Throwable t) { log(1, "shot err " + t); } busy = false; } }).start(); return;
+            case -4: new Thread(() -> {
+                        if (!busy) { busy = true; try { oneShot(); } catch (Throwable t) { log(1, "shot err " + t); } busy = false; }
+                     }).start(); return;
             case -5: new Thread(GameHook::dumpState).start(); return;
-            case -6: LOGBUF.setLength(0); logView.setText(""); return;
+            case -6: logOpen = !logOpen; scroller.setVisibility(logOpen ? View.VISIBLE : View.GONE); return;
+            case -7: togglePanel(); return;
             default:
                 mode = code;
                 stopAll = false;
-                armed = true;
                 log(1, "MODE " + label);
                 status("mode " + label);
                 if (code != OFF && !busy) new Thread(GameHook::loop).start();
@@ -203,34 +259,62 @@ public class GameHook extends AppLifecycleCallback {
         new Handler(Looper.getMainLooper()).post(() -> { if (statusView != null) statusView.setText(s); });
     }
 
+    static class DragTouch implements View.OnTouchListener {
+        final WindowManager.LayoutParams lp;
+        int sx0, sy0, bx, by;
+        DragTouch(WindowManager.LayoutParams l) { lp = l; }
+        public boolean onTouch(View v, MotionEvent e) {
+            switch (e.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    sx0 = (int) e.getRawX();
+                    sy0 = (int) e.getRawY();
+                    bx = lp.x;
+                    by = lp.y;
+                    return false;
+                case MotionEvent.ACTION_MOVE:
+                    lp.x = bx + (int) e.getRawX() - sx0;
+                    lp.y = by + (int) e.getRawY() - sy0;
+                    try { wm.updateViewLayout(v, lp); } catch (Throwable t) {}
+                    return true;
+            }
+            return false;
+        }
+    }
+
     static void log(int lvl, String s) {
         if (lvl > dbg) return;
         Log.i(TAG, s);
         String line = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(new Date()) + " " + s;
         LOGBUF.append(line).append('\n');
-        if (LOGBUF.length() > LOGBUF_MAX) LOGBUF.delete(0, 12000);
-        try { FileWriter w = new FileWriter(new File(outDir, "log.txt"), true); w.write(line + "\n"); w.close(); } catch (Throwable t) {}
+        if (LOGBUF.length() > 60000) LOGBUF.delete(0, 12000);
+        try {
+            if (outDir != null) {
+                FileWriter w = new FileWriter(new File(outDir, "log.txt"), true);
+                w.write(line + "\n");
+                w.close();
+            }
+        } catch (Throwable t) {}
         new Handler(Looper.getMainLooper()).post(() -> {
-            if (logView != null) { logView.setText(LOGBUF.toString()); scroller.fullScroll(ScrollView.FOCUS_DOWN); }
+            if (logView != null) {
+                logView.setText(LOGBUF.toString());
+                if (logOpen) scroller.fullScroll(ScrollView.FOCUS_DOWN);
+            }
         });
     }
 
     static void saveShot(String name) {
         try {
             File f = new File(outDir, name + ".png");
-            String cmd = "screencap -p " + f.getAbsolutePath();
-            Process p = hasSu() ? Runtime.getRuntime().exec(new String[]{"su", "-c", cmd})
-                                : Runtime.getRuntime().exec(cmd);
-            p.waitFor();
-            log(2, "shot saved " + f.getName() + " size=" + f.length());
+            if (captureToFile(f)) log(2, "saved " + f.getName() + " " + f.length());
         } catch (Throwable t) { log(1, "saveShot " + t); }
     }
 
-    static boolean hasSu = true;
-    static boolean hasSu() { return hasSu; }
-
     static void saveCal() {
-        try { FileWriter w = new FileWriter(new File(outDir, "cal.txt")); w.write(CX + " " + CY + " " + SCX + " " + SCY); w.close(); } catch (Throwable t) {}
+        try {
+            FileWriter w = new FileWriter(new File(outDir, "cal.txt"));
+            w.write(CX + " " + CY + " " + SCX + " " + SCY);
+            w.close();
+        } catch (Throwable t) {}
     }
 
     static void dumpState() {
@@ -244,7 +328,7 @@ public class GameHook extends AppLifecycleCallback {
             if (libBase != 0) {
                 loadMaps();
                 long t = findTable();
-                w.write("findTable=" + (t == 0 ? "none" : "0x" + Long.toHexString(t)) + "\n");
+                w.write("table=" + (t == 0 ? "none" : "0x" + Long.toHexString(t)) + "\n");
                 if (t != 0) {
                     long[] pk = collect(t + F_PUCK, 24);
                     long[] po = collect(t + F_POCKET, 4);
@@ -262,12 +346,8 @@ public class GameHook extends AppLifecycleCallback {
     static void startWatchdog() {
         new Thread(() -> {
             while (true) {
-                sleep(5000);
-                if (busy) {
-                    status("busy shots=" + shotsFired + " pots=" + pots + " fails=" + fails);
-                } else {
-                    status("idle mode=" + mode + " shots=" + shotsFired);
-                }
+                sleep(4000);
+                status((busy ? "busy " : "idle ") + "s" + shotsFired + " p" + pots + " f" + fails);
             }
         }).start();
     }
@@ -299,7 +379,7 @@ public class GameHook extends AppLifecycleCallback {
             sleep(ms / steps);
         }
         send(MotionEvent.ACTION_UP, x2, y2, d);
-        log(2, "swipe " + x1 + "," + y1 + " -> " + x2 + "," + y2 + " " + ms + "ms");
+        log(2, "swipe " + x1 + "," + y1 + "->" + x2 + "," + y2);
     }
 
     static void tap(int x, int y) {
@@ -308,6 +388,92 @@ public class GameHook extends AppLifecycleCallback {
         sleep(40);
         send(MotionEvent.ACTION_UP, x, y, d);
         log(2, "tap " + x + "," + y);
+    }
+
+    /* ================= capture ================= */
+
+    static SurfaceView findSurface(View v) {
+        if (v instanceof SurfaceView) return (SurfaceView) v;
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                SurfaceView s = findSurface(g.getChildAt(i));
+                if (s != null) return s;
+            }
+        }
+        return null;
+    }
+
+    static boolean capturePixels() {
+        Activity a = act;
+        if (a == null) { log(2, "no activity"); return false; }
+        try {
+            SurfaceView sv = findSurface(a.getWindow().getDecorView());
+            if (sv == null) { log(2, "no surface view"); return false; }
+            final int w = sv.getWidth(), h = sv.getHeight();
+            if (w < 200 || h < 200) { log(2, "surface " + w + "x" + h); return false; }
+            final Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            final CountDownLatch latch = new CountDownLatch(1);
+            PixelCopy.request(sv, b, res -> latch.countDown(), new Handler(Looper.getMainLooper()));
+            if (!latch.await(1500, TimeUnit.MILLISECONDS)) { log(1, "pixelcopy timeout"); return false; }
+            PW = w;
+            PH = h;
+            PIX = new int[w * h];
+            b.getPixels(PIX, 0, w, 0, 0, w, h);
+            log(2, "pixelcopy " + w + "x" + h);
+            return true;
+        } catch (Throwable t) { log(1, "pixelcopy " + t); return false; }
+    }
+
+    static boolean captureToFile(File f) {
+        if (capturePixels()) {
+            try {
+                FileOutputStream o = new FileOutputStream(f);
+                Bitmap b = Bitmap.createBitmap(PW, PH, Bitmap.Config.ARGB_8888);
+                b.setPixels(PIX, 0, PW, 0, 0, PW, PH);
+                b.compress(Bitmap.CompressFormat.PNG, 90, o);
+                o.close();
+                return true;
+            } catch (Throwable t) { log(1, "png " + t); }
+        }
+        return screencap(f);
+    }
+
+    static boolean screencap(File f) {
+        String cmd = "screencap -p " + f.getAbsolutePath();
+        for (String su : SU_PATHS) {
+            try {
+                if (!new File(su).exists()) continue;
+                Process p = new ProcessBuilder(su, "-c", cmd).redirectErrorStream(true).start();
+                p.waitFor();
+                if (f.exists() && f.length() > 1000) { log(2, "screencap via " + su); return true; }
+            } catch (Throwable t) { log(2, "su " + su + " " + t); }
+        }
+        try {
+            Process p = new ProcessBuilder("screencap", "-p", f.getAbsolutePath()).start();
+            p.waitFor();
+            if (f.exists() && f.length() > 1000) { log(2, "screencap no su"); return true; }
+        } catch (Throwable t) { log(2, "screencap plain " + t); }
+        return false;
+    }
+
+    static boolean capture() {
+        if (capturePixels()) return true;
+        File f = new File(outDir, "cur.png");
+        if (!screencap(f)) { log(1, "all capture paths failed"); return false; }
+        Bitmap b = BitmapFactory.decodeFile(f.getAbsolutePath());
+        if (b == null) return false;
+        PW = b.getWidth();
+        PH = b.getHeight();
+        PIX = new int[PW * PH];
+        b.getPixels(PIX, 0, PW, 0, 0, PW, PH);
+        return true;
+    }
+
+    static int lum(int x, int y) {
+        if (x < 0 || y < 0 || x >= PW || y >= PH) return 0;
+        int c = PIX[y * PW + x];
+        return (((c >> 16) & 0xFF) + ((c >> 8) & 0xFF) + (c & 0xFF)) / 3;
     }
 
     /* ================= memory ================= */
@@ -337,7 +503,7 @@ public class GameHook extends AppLifecycleCallback {
             for (int i = 0; i < 8; i++) b[i] = (byte) (v >>> (8 * i));
             mem.seek(a);
             mem.write(b);
-        } catch (Throwable t) { log(2, "wr fail " + Long.toHexString(a)); }
+        } catch (Throwable t) { log(2, "wr fail"); }
     }
 
     static boolean inRw(long a) {
@@ -391,18 +557,14 @@ public class GameHook extends AppLifecycleCallback {
     }
 
     static int mapCount(long m) {
-        long b = rq(m), e = rq(m + 8);
+        long b = rq(m), e = rq(m + 8), sz = rq(m + 0x10);
         if (!inRw(b) || !inRw(e) || e < b) return -1;
-        long sz = rq(m + 0x10);
-        if (sz >= 0 && sz <= 64) return (int) sz;
-        return -1;
+        return (sz >= 0 && sz <= 64) ? (int) sz : -1;
     }
-
-    /* ================= discovery ================= */
 
     static long findTable() {
         long t = findByClassref();
-        if (t != 0) { log(2, "table via classref 0x" + Long.toHexString(t)); return t; }
+        if (t != 0) return t;
         t = findBySignature();
         if (t != 0) { log(1, "table via signature 0x" + Long.toHexString(t)); return t; }
         noTable++;
@@ -430,18 +592,14 @@ public class GameHook extends AppLifecycleCallback {
                 }
             }
         }
-        if (best != 0) log(2, String.format(Locale.US, "classref best 0x%x sc %.2f", best, bestSc));
+        if (best != 0) log(2, String.format(Locale.US, "classref 0x%x sc%.2f", best, bestSc));
         return bestSc >= 0.10 ? best : 0;
     }
 
     static boolean plausible(long q) {
         if (!inRw(rq(q + F_STRIKER)) || !inRw(rq(q + F_PUCK)) || !inRw(rq(q + F_POCKET))) return false;
         int a = mapCount(q + F_PUCK), b = mapCount(q + F_STRIKER), c = mapCount(q + F_POCKET);
-        if (a < 0 || b < 0 || c < 0) return false;
-        if (c != 4) return false;
-        if (b < 1 || b > 4) return false;
-        if (a < 1 || a > 30) return false;
-        return true;
+        return a >= 1 && a <= 30 && b >= 1 && b <= 4 && c == 4;
     }
 
     static double scoreTable(long q) {
@@ -465,9 +623,9 @@ public class GameHook extends AppLifecycleCallback {
     static long findBySignature() {
         for (int i = 0; i < rwN; i++) {
             for (long a = RW_S[i]; a + 0x18 <= RW_E[i]; a += 8) {
-                long b = rq(a), e = rq(a + 8), sz = rq(a + 0x10);
+                long sz = rq(a + 0x10);
                 if (sz != 4) continue;
-                if (!inRw(b) || !inRw(e) || e < b) continue;
+                if (!inRw(rq(a)) || !inRw(rq(a + 8))) continue;
                 long[] vals = collect(a, 4);
                 if (vals.length != 4) continue;
                 int good = 0;
@@ -485,32 +643,7 @@ public class GameHook extends AppLifecycleCallback {
         return 0;
     }
 
-    /* ================= image ================= */
-
-    static boolean capture() {
-        try {
-            File f = new File(outDir, "cur.png");
-            String cmd = "screencap -p " + f.getAbsolutePath();
-            Process p = hasSu() ? Runtime.getRuntime().exec(new String[]{"su", "-c", cmd})
-                                : Runtime.getRuntime().exec(cmd);
-            int rc = p.waitFor();
-            if (rc != 0 && hasSu) { hasSu = false; log(1, "su screencap rc=" + rc + " -> trying without"); return capture(); }
-            Bitmap b = BitmapFactory.decodeFile(f.getAbsolutePath());
-            if (b == null) { log(1, "decode null rc=" + rc + " size=" + f.length()); return false; }
-            PW = b.getWidth();
-            PH = b.getHeight();
-            PIX = new int[PW * PH];
-            b.getPixels(PIX, 0, PW, 0, 0, PW, PH);
-            log(2, "capture " + PW + "x" + PH);
-            return true;
-        } catch (Throwable t) { log(1, "capture " + t); return false; }
-    }
-
-    static int lum(int x, int y) {
-        if (x < 0 || y < 0 || x >= PW || y >= PH) return 0;
-        int c = PIX[y * PW + x];
-        return (((c >> 16) & 0xFF) + ((c >> 8) & 0xFF) + (c & 0xFF)) / 3;
-    }
+    /* ================= geometry ================= */
 
     static boolean calibrate() {
         calOk = false;
@@ -549,13 +682,14 @@ public class GameHook extends AppLifecycleCallback {
                 if (hn < 16) { hx[hn] = mx; hy[hn] = my; hn++; }
             }
         }
-        log(2, "dark blobs=" + hn);
+        log(2, "blobs " + hn);
         if (hn < 4) return false;
         int[] cx4 = {-1, -1}, cy4 = {-1, -1};
         for (int q = 0; q < 4; q++) {
             int right = q & 1, low = q >> 1;
             long bx = right == 1 ? PW : 0, by = low == 1 ? y1 : 0;
-            long bd = Long.MAX_VALUE; int bi = -1;
+            long bd = Long.MAX_VALUE;
+            int bi = -1;
             for (int i = 0; i < hn; i++) {
                 long dx = hx[i] - bx, dy = hy[i] - by;
                 long d = dx * dx + dy * dy;
@@ -563,16 +697,11 @@ public class GameHook extends AppLifecycleCallback {
             }
             if (bi >= 0) { cx4[right] = hx[bi]; cy4[low] = hy[bi]; }
         }
-        if (cx4[0] <= 0 || cx4[1] <= 0 || cy4[0] <= 0 || cy4[1] <= 0) {
-            log(2, "holes incomplete");
-            return false;
-        }
+        if (cx4[0] <= 0 || cx4[1] <= 0 || cy4[0] <= 0 || cy4[1] <= 0) return false;
         double nx = (cx4[1] - cx4[0]) / (2 * POCKET);
         double ny = (cy4[1] - cy4[0]) / (2 * POCKET);
         log(2, String.format(Locale.US, "holes L%d R%d T%d B%d sx%.3f sy%.3f", cx4[0], cx4[1], cy4[0], cy4[1], nx, ny));
-        if (nx < 0.4 || nx > 2.5 || ny < 0.4 || ny > 2.5) return false;
-        if (Math.abs(nx - ny) > 0.7) return false;
-        if (Math.abs(cx4[0] + cx4[1]) / 2.0 < PW * 0.3) return false;
+        if (nx < 0.4 || nx > 2.5 || ny < 0.4 || ny > 2.5 || Math.abs(nx - ny) > 0.7) return false;
         CX = (cx4[0] + cx4[1]) / 2;
         CY = (cy4[0] + cy4[1]) / 2;
         SCX = nx;
@@ -583,6 +712,10 @@ public class GameHook extends AppLifecycleCallback {
 
     static int px(double wx) { return (int) (CX + wx * SCX); }
     static int py(double wy) { return (int) (CY - wy * SCY); }
+
+    static boolean okWorld(double x, double y) {
+        return !Double.isNaN(x) && !Double.isNaN(y) && Math.abs(x) <= 231 && Math.abs(y) <= 231;
+    }
 
     static int strikerY(boolean bottom) {
         int base = bottom ? (int) (CY + 254.6 * SCY) : (int) (CY - 254.6 * SCY);
@@ -598,7 +731,7 @@ public class GameHook extends AppLifecycleCallback {
                 if (s > bv) { bv = s; best = yy; }
             }
         }
-        return bv > 150 * 25 ? best : -1;
+        return bv > 3750 ? best : -1;
     }
 
     static int strikerX(int yy) {
@@ -611,14 +744,10 @@ public class GameHook extends AppLifecycleCallback {
         return cn > 20 ? (int) (ax / cn) : CX;
     }
 
-    static boolean okWorld(double x, double y) {
-        return !Double.isNaN(x) && !Double.isNaN(y) && Math.abs(x) <= 231 && Math.abs(y) <= 231;
-    }
-
-    /* ================= loop ================= */
+    /* ================= shot ================= */
 
     static void loop() {
-        if (busy) { log(2, "loop already running"); return; }
+        if (busy) return;
         busy = true;
         try {
             if (mem == null && !openMem()) return;
@@ -632,44 +761,37 @@ public class GameHook extends AppLifecycleCallback {
             log(1, "loop err " + t);
         } finally {
             busy = false;
-            log(1, "loop end shots=" + shotsFired + " pots=" + pots + " fails=" + fails);
-            status("stopped");
+            log(1, "end s" + shotsFired + " p" + pots + " f" + fails);
         }
     }
 
     static void oneShot() throws Exception {
         loadMaps();
-        if (libBase == 0) { log(1, "lib not mapped yet"); fails++; return; }
+        if (libBase == 0) { log(1, "lib not mapped"); fails++; return; }
         if (!capture()) { fails++; return; }
-        if (!calibrate()) {
-            fails++;
-            saveShot("failcal_" + System.currentTimeMillis());
-            return;
-        }
-        log(2, String.format(Locale.US, "cal cx%d cy%d sx%.3f sy%.3f %dx%d", CX, CY, SCX, SCY, PW, PH));
+        if (!calibrate()) { fails++; saveShot("failcal_" + System.currentTimeMillis()); return; }
 
         long tn = 0;
-        for (int tryn = 0; tryn < 4 && tn == 0; tryn++) {
+        for (int i = 0; i < 4 && tn == 0; i++) {
             tn = findTable();
-            if (tn == 0) { log(2, "no table try " + (tryn + 1)); sleep(350); }
+            if (tn == 0) sleep(350);
         }
-        if (tn == 0) { fails++; log(1, "no live table after 4 tries"); return; }
+        if (tn == 0) { fails++; log(1, "no table"); return; }
 
         int sy = strikerY(true);
-        if (sy < 0) { log(1, "no striker on bottom rail (opponent turn?)"); return; }
+        if (sy < 0) { log(1, "no striker on our rail"); return; }
         int sx = strikerX(sy);
         log(2, "striker " + sx + "," + sy);
 
         long[] pucks = collect(tn + F_PUCK, 24);
         long[] pockets = collect(tn + F_POCKET, 4);
-        if (pucks.length < 1 || pockets.length < 4) { fails++; log(1, "nodes p=" + pucks.length + " q=" + pockets.length); return; }
+        if (pucks.length < 1 || pockets.length < 4) { fails++; return; }
 
         int[] plv = new int[pucks.length];
         for (int i = 0; i < pucks.length; i++) {
             double wx = rd(pucks[i] + 0x258), wy = rd(pucks[i] + 0x260);
             if (!okWorld(wx, wy)) { plv[i] = -1; continue; }
-            int x = px(wx), y = py(wy);
-            int s = 0, c = 0;
+            int x = px(wx), y = py(wy), s = 0, c = 0;
             for (int u = -2; u <= 2; u++) for (int v = -2; v <= 2; v++) {
                 if (x + u < 0 || y + v < 0 || x + u >= PW || y + v >= PH) continue;
                 s += lum(x + u, y + v);
@@ -684,16 +806,19 @@ public class GameHook extends AppLifecycleCallback {
         int med = 128;
         if (n2 > 0) {
             int acc = 0;
-            for (int v : sorted) { if (v < 0) continue; acc++; if (acc >= n2 / 2) { med = v; break; } }
+            for (int v : sorted) {
+                if (v < 0) continue;
+                acc++;
+                if (acc >= n2 / 2) { med = v; break; }
+            }
         }
-        log(2, "pucks=" + pucks.length + " median=" + med + " values=" + Arrays.toString(plv));
+        log(2, "pucks " + pucks.length + " med " + med + " " + Arrays.toString(plv));
 
         int bp = -1, bq = -1, bblk = 0, bfoul = 0;
         double bestSc = 1e18, gxs = 0, gys = 0;
         for (int k = 0; k < pucks.length; k++) {
             if (plv[k] < 0) continue;
-            double pxw = rd(pucks[k] + 0x258), pyw = rd(pucks[k] + 0x260);
-            double pxs = px(pxw), pys = py(pyw);
+            double pxs = px(rd(pucks[k] + 0x258)), pys = py(rd(pucks[k] + 0x260));
             if (pxs < 3 || pxs > PW - 4 || pys < 3 || pys > PH - 4) continue;
             for (int q = 0; q < pockets.length; q++) {
                 double qxw = rd(pockets[q] + 0x258), qyw = rd(pockets[q] + 0x260);
@@ -734,19 +859,15 @@ public class GameHook extends AppLifecycleCallback {
         }
         if (bp < 0) { fails++; log(1, "no target"); return; }
 
-        double ax = gxs - sx, ay = gys - sy;
-        double AL = Math.hypot(ax, ay);
+        double ax = gxs - sx, ay = gys - sy, AL = Math.hypot(ax, ay);
         double ux = ax / AL, uy = ay / AL;
         int drag = (int) (140 * (SCX + SCY) / 2 / 0.888);
-        int tx = (int) (sx - ux * drag), ty = (int) (sy - uy * drag);
-        tx = Math.max(1, Math.min(PW - 2, tx));
-        ty = Math.max(1, Math.min(PH - 2, ty));
+        int tx = Math.max(1, Math.min(PW - 2, (int) (sx - ux * drag)));
+        int ty = Math.max(1, Math.min(PH - 2, (int) (sy - uy * drag)));
 
-        log(1, String.format(Locale.US, "SHOT puck%d pocket%d blk%d foul%d score%.0f aim %.3f,%.3f drag%d",
-                bp, bq + 1, bblk, bfoul, bestSc, ux, uy, drag));
+        log(1, String.format(Locale.US, "SHOT p%d q%d blk%d foul%d sc%.0f aim%.3f,%.3f drag%d", bp, bq + 1, bblk, bfoul, bestSc, ux, uy, drag));
         saveShot("before_" + System.currentTimeMillis());
 
-        int beforeX = sx, beforeY = sy;
         if (mode == A3) {
             wr(pucks[bp] + 0xd0, ux);
             wr(pucks[bp] + 0xd8, uy);
@@ -759,22 +880,19 @@ public class GameHook extends AppLifecycleCallback {
         shotsFired++;
 
         sleep(1200);
-        int movedX = -1, movedY = -1;
         capture();
         int sy2 = strikerY(true);
         if (sy2 >= 0) {
-            movedX = strikerX(sy2);
-            movedY = sy2;
-            int d = (int) Math.hypot(movedX - beforeX, movedY - beforeY);
-            log(2, "striker after " + movedX + "," + movedY + " delta=" + d);
-            if (d < 4) { log(1, "SHOT DID NOT REGISTER (delta " + d + ")"); fails++; }
+            int mx = strikerX(sy2);
+            int d = (int) Math.hypot(mx - sx, sy2 - sy);
+            log(2, "after " + mx + "," + sy2 + " d" + d);
+            if (d < 4) { log(1, "DID NOT REGISTER"); fails++; }
         } else {
-            log(1, "striker gone after shot (fired)");
+            log(2, "striker gone -> fired");
             pots++;
         }
         sleep(5200);
         saveShot("after_" + System.currentTimeMillis());
-        log(2, "shot done, totals shots=" + shotsFired + " pots=" + pots + " fails=" + fails);
     }
 
     static double segd(double px, double py, double ax, double ay, double bx, double by) {
@@ -789,12 +907,10 @@ public class GameHook extends AppLifecycleCallback {
         double dx = cx - ax, dy = cy - ay;
         double t = dx * ux + dy * uy;
         if (t < -r) return 1e18;
-        double px = ax + ux * t, py = ay + uy * t;
-        double d = Math.hypot(cx - px, cy - py);
+        double d = Math.hypot(cx - (ax + ux * t), cy - (ay + uy * t));
         if (d > r) return 1e18;
         double b = Math.sqrt(r * r - d * d);
-        double tt = t - b;
-        return tt < 0 ? t + b : tt;
+        return (t - b < 0) ? t + b : t - b;
     }
 
     static void sleep(int ms) { try { Thread.sleep(ms); } catch (InterruptedException ignored) {} }
