@@ -72,7 +72,7 @@ public class MainActivity extends Activity {
                 
                 say("Launching Carrom Pool...");
                 
-                // FIX: Standardizing implementation package execution binding
+                // Launching the resolved package using standard package descriptor
                 BlackBoxCore.get().launchPackage(GAME, USER);
                 say("Launched. Open Carrom Pool.");
                 
