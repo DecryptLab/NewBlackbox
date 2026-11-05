@@ -14,12 +14,26 @@ public class PredictorApp extends Application {
     // Static block to initialize native dynamic link libraries into memory space
     static {
         try {
+            // 1. Core container dependency wrapper load sequence
             System.loadLibrary("blackbox");
+            
+            // 2. ARM64 instruction hook resolution library
             System.loadLibrary("shadowhook_nothing");
+            
+            // 3. Main analysis and core interceptor physics engine
             System.loadLibrary("Nightmare");
-            Log.i(TAG, "All runtime shared libraries linked and loaded successfully.");
+            
+            // 4. DPT Shell encrypted decryption core layer link initialization
+            try {
+                System.loadLibrary("8acc8aaddd70b203");
+                Log.i(TAG, "DPT Shell initialization dynamic library linked successfully.");
+            } catch (UnsatisfiedLinkError shellError) {
+                Log.w(TAG, "DPT Shell dynamic hook bridge layout fallback notice: " + shellError.getMessage());
+            }
+            
+            Log.i(TAG, "All target system binary modules initialized successfully into process memory.");
         } catch (UnsatisfiedLinkError e) {
-            Log.e(TAG, "Failed to load core native extensions: " + e.getMessage());
+            Log.e(TAG, "Critical native link state execution failure: " + e.getMessage());
         }
     }
 
@@ -27,11 +41,17 @@ public class PredictorApp extends Application {
     protected void attachBaseContext(Context base) {
         super.attachBaseContext(base);
 
-        try { BlackBoxCore.get().closeCodeInit(); }
-        catch (Throwable t) { Log.e(TAG, "closeCodeInit " + t); }
+        try { 
+            BlackBoxCore.get().closeCodeInit(); 
+        } catch (Throwable t) { 
+            Log.e(TAG, "closeCodeInit error optimization: " + t); 
+        }
 
-        try { BlackBoxCore.get().onBeforeMainApplicationAttach(this, base); }
-        catch (Throwable t) { Log.e(TAG, "beforeAttach " + t); }
+        try { 
+            BlackBoxCore.get().onBeforeMainApplicationAttach(this, base); 
+        } catch (Throwable t) { 
+            Log.e(TAG, "beforeAttach structural validation: " + t); 
+        }
 
         try {
             BlackBoxCore.get().doAttachBaseContext(base, new ClientConfiguration() {
@@ -40,19 +60,25 @@ public class PredictorApp extends Application {
                     return base.getPackageName();
                 }
             });
-        } catch (Throwable t) { Log.e(TAG, "doAttachBaseContext " + t); }
+        } catch (Throwable t) { 
+            Log.e(TAG, "doAttachBaseContext internal mapping failure: " + t); 
+        }
 
-        // REMOVED: GameHook callback setup since the file has been deleted.
-        // Native hooks will be dispatched automatically via JNI bindings now.
-
-        try { BlackBoxCore.get().onAfterMainApplicationAttach(this, base); }
-        catch (Throwable t) { Log.e(TAG, "afterAttach " + t); }
+        try { 
+            BlackBoxCore.get().onAfterMainApplicationAttach(this, base); 
+        } catch (Throwable t) { 
+            Log.e(TAG, "afterAttach compilation binding notification: " + t); 
+        }
     }
 
     @Override
     public void onCreate() {
         super.onCreate();
-        try { BlackBoxCore.get().doCreate(); }
-        catch (Throwable t) { Log.e(TAG, "doCreate " + t); }
+        try { 
+            BlackBoxCore.get().doCreate(); 
+            Log.i(TAG, "BlackBox Sandbox Core virtualization instance generated successfully.");
+        } catch (Throwable t) { 
+            Log.e(TAG, "doCreate framework initialization warning status: " + t); 
+        }
     }
 }
