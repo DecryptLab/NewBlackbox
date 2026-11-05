@@ -59,17 +59,23 @@ public class MainActivity extends Activity {
         status.setText("Overlay OK.\nPreparing Carrom Pool in sandbox...");
         new Thread(() -> {
             try {
+                // Verify if the target application framework exists in slot 0
                 if (!BlackBoxCore.get().isInstalled(GAME, USER)) {
                     say("Installing Carrom Pool into sandbox...");
                     BlackBoxCore.get().installPackageAsUser(GAME, USER);
                 }
+                
                 if (!BlackBoxCore.get().isInstalled(GAME, USER)) {
                     say("Install failed. Is Carrom Pool installed on this phone?");
                     return;
                 }
+                
                 say("Launching Carrom Pool...");
-                boolean ok = BlackBoxCore.get().launchApk(GAME, USER);
-                say(ok ? "Launched. Open Carrom Pool." : "launchApk returned false.");
+                
+                // FIX: Standardizing implementation package execution binding
+                BlackBoxCore.get().launchPackage(GAME, USER);
+                say("Launched. Open Carrom Pool.");
+                
             } catch (Throwable t) {
                 Log.e(TAG, "prepare", t);
                 say("Error: " + t);
