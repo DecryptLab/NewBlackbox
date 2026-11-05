@@ -1,12 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://android.com">
 
-    <!-- Primary window orchestration overlay permission -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-    <!-- Global sandboxing application queries capability alignment -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
-    
-    <!-- Legacy and raw system media configuration scopes -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
@@ -18,11 +14,7 @@
         android:icon="@android:drawable/sym_def_app_icon"
         android:label="Carrom Predictor"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
-        
-        <!-- FORCE EXTRACTIONS MAPPING: Crucial for unpacking dynamic link libs correctly -->
         android:extractNativeLibs="true"
-        
-        <!-- HARDWARE STORAGE VISIBILITY COMPATIBILITY FLAGS -->
         android:requestLegacyExternalStorage="true"
         android:preserveLegacyExternalStorage="true">
 
