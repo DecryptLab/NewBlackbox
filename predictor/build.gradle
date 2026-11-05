@@ -13,11 +13,24 @@ android {
         targetSdk rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+
+        // CRITICAL FIX: Forces the build system to only packaging the 64-bit architecture
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+    }
+
+    // EXPLICIT SOURCE SET MAPPING: Declares your custom jniLibs path
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
     }
 
     buildTypes {
         release {
             minifyEnabled false
+            // Optional: optimization flags can go here
         }
     }
 
@@ -28,6 +41,13 @@ android {
 
     lintOptions {
         abortOnError false
+    }
+
+    // PACKAGING SETTINGS: Avoid conflicts with custom named system libraries
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 
     applicationVariants.configureEach { variant ->
