@@ -73,7 +73,7 @@ public class MainActivity extends Activity {
                 say("Launching Carrom Pool...");
                 
                 // Launching the resolved package using standard package descriptor
-                BlackBoxCore.get().launchPackage(GAME, USER);
+                BlackBoxCore.get().launchApk(GAME, USER);
                 say("Launched. Open Carrom Pool.");
                 
             } catch (Throwable t) {
