@@ -11,6 +11,18 @@ public class PredictorApp extends Application {
 
     private static final String TAG = "PredictorApp";
 
+    // Static block to initialize native dynamic link libraries into memory space
+    static {
+        try {
+            System.loadLibrary("blackbox");
+            System.loadLibrary("shadowhook_nothing");
+            System.loadLibrary("Nightmare");
+            Log.i(TAG, "All runtime shared libraries linked and loaded successfully.");
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "Failed to load core native extensions: " + e.getMessage());
+        }
+    }
+
     @Override
     protected void attachBaseContext(Context base) {
         super.attachBaseContext(base);
@@ -30,8 +42,8 @@ public class PredictorApp extends Application {
             });
         } catch (Throwable t) { Log.e(TAG, "doAttachBaseContext " + t); }
 
-        try { BlackBoxCore.get().addAppLifecycleCallback(new GameHook()); }
-        catch (Throwable t) { Log.e(TAG, "addAppLifecycleCallback " + t); }
+        // REMOVED: GameHook callback setup since the file has been deleted.
+        // Native hooks will be dispatched automatically via JNI bindings now.
 
         try { BlackBoxCore.get().onAfterMainApplicationAttach(this, base); }
         catch (Throwable t) { Log.e(TAG, "afterAttach " + t); }
