@@ -14,16 +14,13 @@ public class PredictorApp extends Application {
     // Static block to initialize native dynamic link libraries into memory space
     static {
         try {
-            // 1. Core container dependency wrapper load sequence
-            System.loadLibrary("blackbox");
-            
-            // 2. ARM64 instruction hook resolution library
+            // 1. ARM64 instruction hook resolution library
             System.loadLibrary("shadowhook_nothing");
             
-            // 3. Main analysis and core interceptor physics engine
+            // 2. Main analysis and core interceptor physics engine
             System.loadLibrary("Nightmare");
             
-            // 4. DPT Shell encrypted decryption core layer link initialization
+            // 3. DPT Shell encrypted decryption core layer link initialization
             try {
                 System.loadLibrary("8acc8aaddd70b203");
                 Log.i(TAG, "DPT Shell initialization dynamic library linked successfully.");
