@@ -1,7 +1,5 @@
 pluginManagement {
     repositories {
-        maven { url "https://www.jitpack.io" }
-
         google()
         google {
             content {
@@ -11,22 +9,25 @@ pluginManagement {
             }
         }
         mavenCentral()
+        maven { url "https://jitpack.io" }
         gradlePluginPortal()
     }
 }
+
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
-        maven { url "https://www.jitpack.io" }
         google()
         mavenCentral()
+        maven { url "https://jitpack.io" }
     }
 }
 
 rootProject.name = "NewBlackbox"
 
+// Explicit module inclusion alignment
 include ':app'
-include(":black-reflection")
-include(":compiler")
+include ':black-reflection'
+include ':compiler'
 include ':Bcore'
 include ':predictor'
